@@ -377,6 +377,9 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        # Optional pre-computed sentence ids for sentencepo loss
+        if "sentence_ids" in data.batch.keys():
+            select_keys.append("sentence_ids")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -438,6 +441,25 @@ class DataParallelPPOActor(BasePPOActor):
                     # Extract pre-computed rollout importance sampling weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                    # If using sentencepo loss, also fetch sentence_ids from batch
+                    sentence_ids = None
+                    if loss_mode == "sentencepo":
+                        sentence_ids = model_inputs.get("sentence_ids", None)
+                        if sentence_ids is None:
+                            raise ValueError(
+                                "sentencepo loss_mode requires 'sentence_ids' tensor in batch; "
+                                "please ensure rollout populates batch['sentence_ids']."
+                            )
+                        if sentence_ids.dim() == 1:
+                            sentence_ids = sentence_ids.unsqueeze(0)
+
+                        if sentence_ids.shape != response_mask.shape:
+                            raise ValueError(
+                                "SentencePO expects sentence_ids shape to match response_mask; "
+                                f"got {sentence_ids.shape} vs {response_mask.shape}."
+                            )
+
+                        sentence_ids = sentence_ids.long()
 
                     # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
                     # are computed centrally in ray_trainer.py for consistency and efficiency.
@@ -448,8 +470,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-                    # Compute policy loss (all functions return 4 values)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                    policy_loss_kwargs = dict(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -458,6 +479,11 @@ class DataParallelPPOActor(BasePPOActor):
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
                     )
+                    if loss_mode == "sentencepo":
+                        policy_loss_kwargs["sentence_ids"] = sentence_ids
+
+                    # Compute policy loss (all functions return 4 values)
+                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**policy_loss_kwargs)
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

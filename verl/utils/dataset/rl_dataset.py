@@ -102,6 +102,8 @@ class RLHFDataset(Dataset):
         self.prompt_key = config.get("prompt_key", "prompt")
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
+        # When enabled, generate sentence_ids for prompt+response tokens to support SentencePO loss
+        self.enable_sentencepo = config.get("enable_sentencepo", False)
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
@@ -336,6 +338,11 @@ class RLHFDataset(Dataset):
         row_dict["attention_mask"] = attention_mask[0]
         row_dict["position_ids"] = position_ids[0]
 
+        # Optional: build sentence_ids for SentencePO sentence-level loss
+        if self.enable_sentencepo:
+            sentence_ids = self._build_sentence_ids(input_ids[0], attention_mask[0])
+            row_dict["sentence_ids"] = sentence_ids
+
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:
             if self.truncation == "left":
@@ -371,6 +378,28 @@ class RLHFDataset(Dataset):
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
         return row_dict
+
+    def _build_sentence_ids(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Assign sentence ids based on punctuation on valid (attention-masked) tokens."""
+
+        sentence_ids = torch.full_like(input_ids, fill_value=-1)
+
+        valid_positions = attention_mask.nonzero(as_tuple=False).squeeze(-1)
+        if valid_positions.numel() == 0:
+            return sentence_ids
+
+        punctuation_chars = {".", "?", "!", ";", ",", "。", "？", "！", "；"}
+
+        current_sid = 0
+        for pos in valid_positions.tolist():
+            token_id = int(input_ids[pos].item())
+            token_str = self.tokenizer.decode([token_id], skip_special_tokens=False)
+
+            sentence_ids[pos] = current_sid
+            if any(ch in token_str for ch in punctuation_chars):
+                current_sid += 1
+
+        return sentence_ids
 
     def __getstate__(self):
         if not self.serialize_dataset:

@@ -1038,6 +1038,99 @@ def compute_policy_loss_gspo(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+@register_policy_loss("sentencepo")
+def compute_policy_loss_sentencepo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[DictConfig | ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    sentence_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sentence-level policy loss (SentencePO).
+
+    SentencePO mirrors GSPO but aggregates importance ratios at the sentence level
+    (grouped by ``sentence_ids``) before broadcasting back to tokens and applying
+    PPO-style clipping.
+
+    Requirements:
+    - ``sentence_ids`` must be provided (from actor or config.policy_loss.sentence_ids).
+      Shape: (bs, seq_len). Tokens to ignore (e.g., padding) should have id < 0.
+    - ``config`` should be an ``ActorConfig`` to access clip ranges.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+
+    # Prefer runtime-provided sentence_ids; fall back to config if absent.
+    if sentence_ids is None and getattr(config, "policy_loss", None) is not None:
+        sentence_ids = getattr(config.policy_loss, "sentence_ids", None)
+    if sentence_ids is None:
+        raise ValueError(
+            "SentencePO requires non-empty `sentence_ids` tensor; "
+            "please ensure dataset/rollout populates `sentence_ids`."
+        )
+
+    sentence_ids = sentence_ids.to(log_prob.device)
+
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+
+    # token-level KL
+    negative_approx_kl = log_prob - old_log_prob
+
+    # flatten for grouping while keeping sample separation by offsetting ids
+    bs, seq_len = log_prob.shape
+    flat_kl = negative_approx_kl.view(-1)
+    flat_mask = response_mask.view(-1)
+    flat_sid = sentence_ids.view(-1)
+
+    valid = (flat_mask > 0) & (flat_sid >= 0)
+    if not torch.any(valid):
+        raise ValueError("SentencePO: no valid tokens with non-negative sentence_ids found.")
+
+    # offset sentence ids by batch to avoid cross-sample mixing
+    batch_idx = torch.arange(bs, device=log_prob.device).unsqueeze(1).expand(bs, seq_len).reshape(-1)
+    flat_sid_offset = flat_sid + batch_idx * (seq_len + 1)
+
+    flat_kl_valid = flat_kl[valid]
+    flat_sid_valid = flat_sid_offset[valid]
+
+    unique_sid, inv = torch.unique(flat_sid_valid, return_inverse=True)
+    num_sent = unique_sid.numel()
+    kl_sum = torch.zeros(num_sent, device=log_prob.device, dtype=flat_kl.dtype)
+    cnt = torch.zeros(num_sent, device=log_prob.device, dtype=flat_kl.dtype)
+    kl_sum.index_add_(0, inv, flat_kl_valid)
+    cnt.index_add_(0, inv, torch.ones_like(flat_kl_valid, dtype=flat_kl.dtype))
+    sent_kl_mean = kl_sum / (cnt + 1e-8)
+
+    sent_kl_token = torch.zeros_like(flat_kl)
+    sent_kl_token[valid] = sent_kl_mean[inv]
+    sent_kl_token = sent_kl_token.view(bs, seq_len)
+
+    log_sentence_importance_ratio = log_prob - log_prob.detach() + sent_kl_token.detach()
+    log_sentence_importance_ratio = torch.clamp(log_sentence_importance_ratio, max=10.0)
+    sentence_importance_ratio = torch.exp(log_sentence_importance_ratio)
+
+    pg_losses1 = -advantages * sentence_importance_ratio
+    pg_losses2 = -advantages * torch.clamp(sentence_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    # No lower clip in SentencePO; keep shape compatibility
+    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
 @register_policy_loss("gpg")
 def compute_policy_loss_gpg(
     old_log_prob: torch.Tensor,
