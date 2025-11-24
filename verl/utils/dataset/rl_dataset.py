@@ -63,6 +63,12 @@ def collate_fn(data_list: list[dict]) -> dict:
     for key, val in non_tensors.items():
         non_tensors[key] = np.fromiter(val, dtype=object, count=len(val))
 
+    # 增加 batch 偏移，避免跨 batch 的 sentence_ids 混淆
+    if "sentence_ids" in tensors:
+        for b in range(tensors["sentence_ids"].shape[0]):
+            mask = tensors["sentence_ids"][b] >= 0
+            tensors["sentence_ids"][b][mask] += b * 10000
+
     return {**tensors, **non_tensors}
 
 
