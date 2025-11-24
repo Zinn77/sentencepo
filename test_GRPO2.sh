@@ -6,14 +6,17 @@ export HF_HOME=$HOME/sentencepo/models/huggingface
 export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub
 export TRANSFORMERS_CACHE=$HF_HOME/transformers
 
-DS=gsm8k_hasval
-EPOCHS=1
-mkdir -p $HOME/sentencepo/models/grpo_${DS}_qwen2_5_7b_ep${EPOCHS}
+DS=${DS:-gsm8k_hasval}
+EPOCHS=${EPOCHS:-1}
+MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}
+MODEL_NAME=${MODEL_NAME:-qwen2_5_7b}
 
-gsm8k_train_path=$HOME/data/$DS/train.parquet
-gsm8k_val_path=$HOME/data/$DS/val.parquet
-train_files="['$gsm8k_train_path']"
-test_files="['$gsm8k_val_path']"
+mkdir -p $HOME/sentencepo/models/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}
+
+train_path=$HOME/data/$DS/train.parquet
+val_path=$HOME/data/$DS/val.parquet
+train_files="['$train_path']"
+val_files="['$val_path']"
 
 cd $HOME/sentencepo
 
@@ -21,13 +24,13 @@ PYTHONPATH=$HOME/sentencepo \
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="${train_files}" \
-    data.val_files="${test_files}" \
+    data.val_files="${val_files}" \
     data.train_batch_size=256 \
     data.max_prompt_length=512 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-7B-Instruct \
+    actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.optim.lr=5e-8 \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
@@ -49,13 +52,13 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","tensorboard","wandb"]' \
-    trainer.project_name="verl_qwen2_5_7b_${DS}" \
+    trainer.logger='["console","tensorboard"]' \
+    trainer.project_name="verl_${MODEL_NAME}_${DS}" \
     trainer.experiment_name="grpo_ep${EPOCHS}" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
+    trainer.save_freq=50 \
     trainer.test_freq=5 \
     trainer.total_epochs=$EPOCHS \
-    trainer.default_local_dir=$HOME/sentencepo/models/grpo_${DS}_qwen2_5_7b_ep${EPOCHS}/verl_checkpoints_grpo \
-    "$@" 2>&1 | tee $HOME/sentencepo/models/grpo_${DS}_qwen2_5_7b_ep${EPOCHS}/verl_grpo.log
+    trainer.default_local_dir=$HOME/sentencepo/models/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}/verl_checkpoints_grpo \
+    "$@" 2>&1 | tee $HOME/sentencepo/models/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}/verl_grpo.log

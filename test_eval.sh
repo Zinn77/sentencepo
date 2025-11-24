@@ -37,11 +37,15 @@ export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
 # 路径设置
 METHOD_NAME=${METHOD_NAME:-sentencepo} # 方法名称
-TOT_DIR=${TOT_DIR:-$HOME/sentencepo/models/${METHOD_NAME}_gsm8k_hasval_qwen2_5_7b_ep1} # 模型总目录
+DS=${DS:-gsm8k_hasval} # 数据集名称
+MODEL_NAME=${MODEL_NAME:-qwen2_5_7b}
+EPOCHS=${EPOCHS:-1}
+
+TOT_DIR=${TOT_DIR:-$HOME/sentencepo/models/${METHOD_NAME}_${DS}_${MODEL_NAME}_ep${EPOCHS}} # 模型总目录
 
 CKPT_ROOT=${CKPT_ROOT:-${TOT_DIR}/verl_checkpoints_${METHOD_NAME}}
-DATA_PATH=${DATA_PATH:-$HOME/data/gsm8k_hasval/test.parquet} # 或 $HOME/data/aime-2024/test.parquet
-OUT_PATH=${OUT_PATH:-${TOT_DIR}/eval/${METHOD_NAME}_gsm8k_hasval_gen.parquet}
+DATA_PATH=${DATA_PATH:-$HOME/data/${DS}/test.parquet} # 或 $HOME/data/aime-2024/test.parquet
+OUT_PATH=${OUT_PATH:-${TOT_DIR}/eval/${METHOD_NAME}_${DS}_gen.parquet}
 # 合并后的 Hugging Face 模型存放于：MERGED_HF_ROOT/<global_step_xxx>/actor_hf
 MERGED_HF_ROOT=${MERGED_HF_ROOT:-${TOT_DIR}/verl_checkpoints_${METHOD_NAME}_merged}
 
