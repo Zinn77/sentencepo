@@ -198,6 +198,12 @@ def build_sentence_ids_from_responses(
             if any(ch in token_str for ch in PUNCTUATION_CHARS):
                 current_sid += 1
 
+    # 为每个样本加上批内偏移，避免后续按 sentence_id 分组时跨样本串扰
+    for b in range(batch_size):
+        mask = sentence_ids[b] >= 0
+        if mask.any():
+            sentence_ids[b, mask] += b * 10000
+
     return sentence_ids
 
 
