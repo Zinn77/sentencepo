@@ -107,6 +107,9 @@ class RLHFDataset(Dataset):
         self.video_key = config.get("video_key", "videos")
         self.image_patch_size = config.get("image_patch_size", 14)
         self.max_prompt_length = config.get("max_prompt_length", 1024)
+        # 当 enable_sentencepo 为 True 时，会为 prompt+response 序列
+        # 生成 sentence_ids，用于句子级别的策略损失（SentencePO）。
+        self.enable_sentencepo = config.get("enable_sentencepo", False)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")
@@ -416,6 +419,13 @@ class RLHFDataset(Dataset):
         row_dict["attention_mask"] = attention_mask[0]
         row_dict["position_ids"] = position_ids[0]
 
+        # 可选：为句子级策略损失生成 sentence_ids。
+        # 只在有效 attention_mask 位置上标注文本 token，句子 id 从 0,1,2,... 递增，
+        # 填充或非文本位置标为 -1。
+        if self.enable_sentencepo:
+            sentence_ids = self._build_sentence_ids(input_ids[0], attention_mask[0])
+            row_dict["sentence_ids"] = sentence_ids
+
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:
             if self.truncation == "left":
@@ -451,6 +461,40 @@ class RLHFDataset(Dataset):
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
         return row_dict
+
+    def _build_sentence_ids(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """根据标点规则从 token 序列中构造句子编号。
+
+        相同非负 id 的 token 视为同一句；id < 0 的位置（如 padding）
+        在 SentencePO 中会被忽略。
+        """
+
+        # 初始化为 -1，表示默认忽略
+        sentence_ids = torch.full_like(input_ids, fill_value=-1)
+
+        # 只考虑 attention_mask == 1 的位置
+        valid_positions = attention_mask.nonzero(as_tuple=False).squeeze(-1)
+        if valid_positions.numel() == 0:
+            return sentence_ids
+
+        # 通过逐 token decode 判断是否为标点；实现简单直观，
+        # 如有需要可以扩展标点集合。
+        punctuation_chars = {".", "?", "!", ";", ",", "。", "？", "！", "；"}
+
+        current_sid = 0
+        # 按顺序遍历有效 token 位置
+        for pos in valid_positions.tolist():
+            token_id = int(input_ids[pos].item())
+            token_str = self.tokenizer.decode([token_id], skip_special_tokens=False)
+
+            sentence_ids[pos] = current_sid
+
+            # If this token is (or ends with) punctuation, start a new sentence
+            # for subsequent tokens.
+            if any(ch in token_str for ch in punctuation_chars):
+                current_sid += 1
+
+        return sentence_ids
 
     def __getstate__(self):
         if not self.serialize_dataset:

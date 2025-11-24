@@ -57,7 +57,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
-from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import get_response_mask, masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
@@ -160,22 +160,67 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def compute_response_mask(data: DataProto):
-    """Compute the attention mask for the response part of the sequence.
+PUNCTUATION_CHARS = {".", "?", "!", ";", ",", "。", "？", "！", "；"}
 
-    This function extracts the portion of the attention mask that corresponds to the model's response,
-    which is used for masking computations that should only apply to response tokens.
+
+def build_sentence_ids_from_responses(
+    tokenizer,
+    responses: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Generate sentence ids for response tokens based on punctuation heuristics.
 
     Args:
-        data (DataProto): The data containing batched model outputs and inputs.
+        tokenizer: HF tokenizer for decoding individual tokens.
+        responses: Tensor of shape (bsz, response_len) containing token ids.
+        response_mask: Tensor of same shape indicating valid response tokens (1 for valid, 0 otherwise).
 
     Returns:
-        torch.Tensor: The attention mask for the response tokens.
+        torch.LongTensor with same shape as ``responses`` assigning non-negative
+        sentence ids to valid tokens and ``-1`` elsewhere.
     """
+
+    assert responses.shape == response_mask.shape
+
+    batch_size, seq_len = responses.shape
+    sentence_ids = torch.full_like(responses, fill_value=-1, dtype=torch.long)
+
+    for b in range(batch_size):
+        current_sid = 0
+        for idx in range(seq_len):
+            if response_mask[b, idx].item() <= 0:
+                continue
+
+            token_id = int(responses[b, idx].item())
+            token_str = tokenizer.decode([token_id], skip_special_tokens=False)
+            sentence_ids[b, idx] = current_sid
+
+            if any(ch in token_str for ch in PUNCTUATION_CHARS):
+                current_sid += 1
+
+    return sentence_ids
+
+
+def compute_response_mask(data: DataProto):
+    """Construct a mask highlighting valid response tokens.
+
+    Prefers EOS-aware masking when ``eos_token_id`` is available in ``meta_info``.
+    Falls back to masking non-pad tokens otherwise.
+    """
+
     responses = data.batch["responses"]
-    response_length = responses.size(1)
-    attention_mask = data.batch["attention_mask"]
-    return attention_mask[:, -response_length:]
+    eos_token_id = data.meta_info.get("eos_token_id") if data.meta_info is not None else None
+    pad_token_id = data.meta_info.get("pad_token_id") if data.meta_info is not None else None
+
+    if pad_token_id is None:
+        pad_token_id = 0
+    response_mask = (responses != pad_token_id).to(torch.int64)
+
+    if eos_token_id is not None:
+        eos_mask = get_response_mask(responses, eos_token=eos_token_id, dtype=torch.int64)
+        response_mask = torch.minimum(response_mask, eos_mask)
+
+    return response_mask
 
 
 def compute_advantage(
@@ -1080,6 +1125,15 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    if (
+                        self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+                        == "sentencepo"
+                    ):
+                        batch.batch["sentence_ids"] = build_sentence_ids_from_responses(
+                            tokenizer=self.tokenizer,
+                            responses=batch.batch["responses"],
+                            response_mask=batch.batch["response_mask"],
+                        )
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),

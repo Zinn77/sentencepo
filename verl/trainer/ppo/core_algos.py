@@ -1050,6 +1050,119 @@ def compute_policy_loss_gspo(
     return pg_loss, pg_metrics
 
 
+@register_policy_loss("sentencepo")
+def compute_policy_loss_sentencepo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[DictConfig | ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    sentence_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """句子级策略损失（SentencePO）。
+
+    思路与 GSPO 相似，但不是对整条序列计算一个重要性比率，
+    而是按 ``sentence_ids`` 划分句子，分别计算每个句子的比率，
+    再将该句子的比率广播到句内所有 token 上，再做 PPO 式裁剪。
+
+    要求：
+        - ``config`` 必须是 ``ActorConfig``，且其 ``policy_loss`` 字段中
+          需要包含张量 ``sentence_ids``，形状为 (bs, seq_len)。
+          每个 token 对应一个非负整数句子 id；需要忽略的 token（如 padding）
+          其 id 设为 < 0。
+
+    参数：
+        - ``old_log_prob``：旧策略的 log 概率，形状 (bs, seq_len)。
+        - ``log_prob``：当前策略的 log 概率，形状 (bs, seq_len)。
+        - ``advantages``：优势估计，形状 (bs, seq_len)。
+        - ``response_mask``：有效响应 token 的 mask，形状 (bs, seq_len)。
+        - ``loss_agg_mode``：传给 :func:`agg_loss` 的损失聚合方式。
+        - ``config``：携带 clip 比例和 ``sentence_ids`` 的 ``ActorConfig``。
+        - ``rollout_is_weights``：可选的 token 级重要性权重。
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+    # 优先使用从 actor 传入的 sentence_ids；若缺失则尝试从 config 里读取，
+    # 如果依然缺失，说明 SentencePO 数据管道有问题，直接报错而不是退化。
+    if sentence_ids is None and getattr(config, "policy_loss", None) is not None:
+        sentence_ids = getattr(config.policy_loss, "sentence_ids", None)
+    if sentence_ids is None:
+        raise ValueError(
+            "SentencePO requires non-empty `sentence_ids` tensor; "
+            "got None. Please ensure dataset/rollout populates `sentence_ids`."
+        )
+
+    # Ensure tensors are on the same device / dtype
+    sentence_ids = sentence_ids.to(log_prob.device)
+
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+
+    # token 级别的 KL
+    negative_approx_kl = log_prob - old_log_prob
+
+    # 在有效 token 上按 (batch, sentence_id) 聚合并取平均 KL
+    bs, seq_len = log_prob.shape
+    # 展平后便于做分组统计
+    flat_kl = negative_approx_kl.view(-1)
+    flat_mask = response_mask.view(-1)
+    flat_sid = sentence_ids.view(-1)
+
+    # 只保留有效 token（mask > 0）且句子 id >= 0 的位置
+    valid = (flat_mask > 0) & (flat_sid >= 0)
+    if not torch.any(valid):
+        raise ValueError(
+            "SentencePO: no valid tokens with non-negative sentence_ids found; "
+            "check construction of `sentence_ids` and `response_mask`."
+        )
+
+    flat_kl_valid = flat_kl[valid]
+    flat_sid_valid = flat_sid[valid]
+
+    # 将句子 id 压缩到从 0 开始的连续区间
+    unique_sid, inv = torch.unique(flat_sid_valid, return_inverse=True)
+    # Sum KL and counts per sentence
+    num_sent = unique_sid.numel()
+    kl_sum = torch.zeros(num_sent, device=log_prob.device, dtype=flat_kl.dtype)
+    cnt = torch.zeros(num_sent, device=log_prob.device, dtype=flat_kl.dtype)
+    kl_sum.index_add_(0, inv, flat_kl_valid)
+    cnt.index_add_(0, inv, torch.ones_like(flat_kl_valid, dtype=flat_kl.dtype))
+    sent_kl_mean = kl_sum / (cnt + 1e-8)
+
+    # 将句子级 KL 均值映射回 token 级序列
+    sent_kl_token = torch.zeros_like(flat_kl)
+    sent_kl_token[valid] = sent_kl_mean[inv]
+    sent_kl_token = sent_kl_token.view(bs, seq_len)
+
+    # 使用 straight-through trick 构造句子级重要性比率
+    # log_s_ratio = sg[sent_kl] + log_prob - sg[log_prob]
+    log_sentence_importance_ratio = log_prob - log_prob.detach() + sent_kl_token.detach()
+    log_sentence_importance_ratio = torch.clamp(log_sentence_importance_ratio, max=10.0)
+    sentence_importance_ratio = torch.exp(log_sentence_importance_ratio)
+
+    pg_losses1 = -advantages * sentence_importance_ratio
+    pg_losses2 = -advantages * torch.clamp(sentence_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    # 如果提供了 rollout IS 权重，则在 token 级别上加权
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    # 这里简单复用 token 级 KL 作为监控指标
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+    }
+    return pg_loss, pg_metrics
+
+
 @register_policy_loss("gpg")
 def compute_policy_loss_gpg(
     old_log_prob: torch.Tensor,

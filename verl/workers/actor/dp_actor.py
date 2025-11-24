@@ -393,6 +393,9 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        # Optional pre-computed sentence ids for sentencepo loss
+        if "sentence_ids" in data.batch.keys():
+            select_keys.append("sentence_ids")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -458,13 +461,33 @@ class DataParallelPPOActor(BasePPOActor):
                     # Extract pre-computed rollout correction weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                    # If using sentencepo loss, also fetch sentence_ids from batch
+                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                    sentence_ids = None
+                    if loss_mode == "sentencepo":
+                        sentence_ids = model_inputs.get("sentence_ids", None)
+                        if sentence_ids is None:
+                            raise ValueError(
+                                "sentencepo loss_mode requires 'sentence_ids' tensor in batch; "
+                                "please ensure rollout populates batch['sentence_ids']."
+                            )
+                        if sentence_ids.dim() == 1:
+                            sentence_ids = sentence_ids.unsqueeze(0)
+
+                        if sentence_ids.shape != response_mask.shape:
+                            raise ValueError(
+                                "SentencePO expects sentence_ids shape to match response_mask; "
+                                f"got {sentence_ids.shape} vs {response_mask.shape}."
+                            )
+
+                        sentence_ids = sentence_ids.long()
 
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-                    # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
+                    # Build common kwargs for all policy loss fns
+                    policy_loss_kwargs = dict(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -473,6 +496,13 @@ class DataParallelPPOActor(BasePPOActor):
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
                     )
+                    # Only sentencepo loss consumes sentence_ids; avoid passing
+                    # unexpected kwargs to other loss modes.
+                    if loss_mode == "sentencepo":
+                        policy_loss_kwargs["sentence_ids"] = sentence_ids
+
+                    # Compute policy loss (any function is expected to return 2 values)
+                    pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
                     micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using pure rollout correction mode (metrics already in pg_metrics)
