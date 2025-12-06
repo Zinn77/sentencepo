@@ -35,7 +35,8 @@ def process_item(config, data_source, response_lst, reward_data):
     reward_fn = get_custom_reward_fn(config)
     ground_truth = reward_data["ground_truth"]
     score_lst = [reward_fn(data_source, r, ground_truth) for r in response_lst]
-    return data_source, np.mean(score_lst)
+    # Return mean score and max score (for pass@k)
+    return data_source, np.mean(score_lst), np.max(score_lst)
 
 
 @hydra.main(config_path="config", config_name="evaluation", version_base=None)
@@ -47,6 +48,8 @@ def main(config):
     reward_model_data = dataset[config.data.reward_model_key]
 
     total = len(dataset)
+    # Get K from the first response list to label the metric
+    k_samples = len(responses[0]) if total > 0 and len(responses[0]) > 0 else 0
 
     # Initialize Ray
     if not ray.is_initialized():
@@ -54,6 +57,8 @@ def main(config):
 
     # evaluate test_score based on data source
     data_source_reward = defaultdict(list)
+    data_source_pass_k = defaultdict(list)
+
     # Create remote tasks
     remote_tasks = [
         process_item.remote(config, data_sources[i], responses[i], reward_model_data[i]) for i in range(total)
@@ -65,13 +70,15 @@ def main(config):
             # Use ray.wait to get completed tasks
             done_ids, remote_tasks = ray.wait(remote_tasks)
             for result_id in done_ids:
-                data_source, score = ray.get(result_id)
-                data_source_reward[data_source].append(score)
+                data_source, mean_score, max_score = ray.get(result_id)
+                data_source_reward[data_source].append(mean_score)
+                data_source_pass_k[data_source].append(max_score)
                 pbar.update(1)
 
     metric_dict = {}
     for data_source, rewards in data_source_reward.items():
         metric_dict[f"test_score/{data_source}"] = np.mean(rewards)
+        metric_dict[f"pass@{k_samples}/{data_source}"] = np.mean(data_source_pass_k[data_source])
 
     print(metric_dict)
 
