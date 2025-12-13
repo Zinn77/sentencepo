@@ -22,7 +22,7 @@ if __name__ == "__main__":
     # MATH-500 是 MATH 的子集，通常作为 test split
     dataset = datasets.load_dataset(data_source, split="test")
 
-    instruction_following = "Please reason step by step, and put your final answer within \boxed{}."
+    instruction_following = "Please reason step by step, and put your final answer within \\boxed{}."
 
     def process_fn(example, idx):
         question = example.get("problem") or example.get("question")

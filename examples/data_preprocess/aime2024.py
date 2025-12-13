@@ -7,7 +7,14 @@ from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_b
 
 
 def extract_solution(solution_str):
-    return remove_boxed(last_boxed_only_string(solution_str))
+    # AIME 2024 数据答案多数未包 \boxed{}，直接返回原始字符串即可
+    boxed = last_boxed_only_string(solution_str)
+    if boxed is not None:
+        try:
+            return remove_boxed(boxed)
+        except Exception:
+            pass
+    return str(solution_str).strip()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -22,7 +29,7 @@ if __name__ == "__main__":
     # AIME 2024 通常只有 train split，但我们把它作为测试集使用
     dataset = datasets.load_dataset(data_source, split="train")
 
-    instruction_following = "Please reason step by step, and put your final answer within \boxed{}."
+    instruction_following = "Please reason step by step, and put your final answer within \\boxed{}."
 
     def process_fn(example, idx):
         # 尝试获取 problem/question 字段

@@ -6,9 +6,14 @@ from verl.utils.hdfs_io import copy, makedirs
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
 
 
-
 def extract_solution(solution_str):
-    return remove_boxed(last_boxed_only_string(solution_str))
+    boxed = last_boxed_only_string(solution_str)
+    if boxed is not None:
+        try:
+            return remove_boxed(boxed)
+        except Exception:
+            pass
+    return str(solution_str).strip()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -26,7 +31,7 @@ if __name__ == "__main__":
     except:
         dataset = datasets.load_dataset(data_source, split="train")
 
-    instruction_following = "Please reason step by step, and put your final answer within \boxed{}."
+    instruction_following = "Please reason step by step, and put your final answer within \\boxed{}."
 
     def process_fn(example, idx):
         question = example.get("problem") or example.get("question")
