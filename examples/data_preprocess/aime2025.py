@@ -7,7 +7,18 @@ from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_b
 
 
 def extract_solution(solution_str):
-    return remove_boxed(last_boxed_only_string(solution_str))
+    boxed = last_boxed_only_string(solution_str)
+    if boxed is not None:
+        try:
+            return remove_boxed(boxed)
+        except Exception:
+            pass
+    return str(solution_str).strip()
+
+def load_aime2025_all(data_source="opencompass/AIME2025", split="train"):
+    ds_i = datasets.load_dataset(data_source, name="AIME2025-I", split=split)
+    ds_ii = datasets.load_dataset(data_source, name="AIME2025-II", split=split)
+    return datasets.concatenate_datasets([ds_i, ds_ii])
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -17,15 +28,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     data_source = "opencompass/AIME2025"
-    print(f"Loading {data_source}...", flush=True)
+    print(f"Loading {data_source} (I+II)...", flush=True)
     
     # 尝试加载 train split，如果不存在则加载 test
     try:
-        dataset = datasets.load_dataset(data_source, split="train")
-    except:
-        dataset = datasets.load_dataset(data_source, split="test")
+        dataset = load_aime2025_all(split="train")
+    except Exception:
+        dataset = load_aime2025_all(split="test")
 
-    instruction_following = "Please reason step by step, and put your final answer within \boxed{}."
+    instruction_following = "Please reason step by step, and put your final answer within \\boxed{}."
 
     def process_fn(example, idx):
         # 适配不同的字段名
