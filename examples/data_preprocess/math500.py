@@ -47,6 +47,7 @@ if __name__ == "__main__":
         return data
 
     dataset = dataset.map(process_fn, with_indices=True)
+    dataset = dataset.select_columns(["data_source", "prompt",  "ability", "reward_model", "extra_info"])
 
     local_save_dir = os.path.expanduser(args.local_save_dir)
     os.makedirs(local_save_dir, exist_ok=True)
