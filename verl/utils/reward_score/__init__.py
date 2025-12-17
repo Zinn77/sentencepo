@@ -16,6 +16,24 @@
 from verl.utils.import_utils import deprecated
 
 
+def _is_math_dataset(data_source):
+    """Check if the data source is a math dataset with \boxed{}."""
+    ds = data_source.lower()
+    
+    math_keywords = [
+        "aime",
+        "amc", 
+        "math",
+        "minerva",
+        "olympiad",
+    ]
+    
+    for keyword in math_keywords:
+        if keyword in ds:
+            return True
+    return False
+
+
 def default_compute_score(
     data_source,
     solution_str,
@@ -44,7 +62,8 @@ def default_compute_score(
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
-    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
+    elif _is_math_dataset(data_source) or data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
+        # Covers: aime*, amc*, math*, *minerva*, *olympiad*
         from . import math_reward
 
         res = math_reward.compute_score(solution_str, ground_truth)
