@@ -259,7 +259,23 @@ class _TensorboardAdapter:
 
     def log(self, data, step):
         for key in data:
-            self.writer.add_scalar(key, data[key], step)
+            val = data[key]
+            # Prefer histogram when value is a tensor/ndarray with more than one element
+            try:
+                import numpy as np
+                import torch
+
+                is_tensor = isinstance(val, torch.Tensor)
+                is_array = isinstance(val, np.ndarray)
+                if (is_tensor and val.numel() > 1) or (is_array and val.size > 1):
+                    arr = val.detach().cpu().numpy() if is_tensor else val
+                    self.writer.add_histogram(key, arr, step)
+                    continue
+            except Exception:
+                # Fall back to scalar logging if histogram fails
+                pass
+
+            self.writer.add_scalar(key, val, step)
 
     def finish(self):
         self.writer.close()

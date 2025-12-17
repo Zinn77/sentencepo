@@ -29,6 +29,7 @@ import torch
 from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
+from verl.trainer.ppo.metric_utils import compute_sentencepo_metrics
 from verl.trainer.config import AlgoConfig
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
@@ -1160,6 +1161,20 @@ def compute_policy_loss_sentencepo(
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
     }
+
+    # Sentence-level monitoring (lightweight, no histograms here)
+    try:
+        sentencepo_metrics = compute_sentencepo_metrics(
+            sentence_ids=sentence_ids,
+            response_mask=response_mask,
+            log_prob=log_prob,
+            old_log_prob=old_log_prob,
+            hist_enable=False,
+        )
+        pg_metrics.update(sentencepo_metrics)
+    except Exception:
+        # Do not break training if monitoring fails
+        pass
     return pg_loss, pg_metrics
 
 
