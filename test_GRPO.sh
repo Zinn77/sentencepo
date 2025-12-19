@@ -31,7 +31,7 @@ max_response_length=1024
 # max_num_batched_tokens >= max_prompt_length + max_response_length，或开启 enable_chunked_prefill
 max_num_batched_tokens=4096    # 默认 8192
 
-mkdir -p $HOME/autodl-tmp/models/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}
+mkdir -p $HOME/autodl-tmp/models/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}
 
 cd $HOME/sentencepo
 
@@ -46,7 +46,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +data.apply_chat_template_kwargs.enable_thinking=$qwen3_enable_thinking \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    +data.enable_sentencepo=true \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.optim.lr=$lr \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -71,7 +70,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_num_batched_tokens=$max_num_batched_tokens \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.policy_loss.loss_mode=sentencepo \
     actor_rollout_ref.actor.checkpoint.save_contents='["model"]' \
     actor_rollout_ref.actor.checkpoint.load_contents='["model"]' \
     critic.checkpoint.save_contents='["model"]' \
@@ -80,13 +78,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","tensorboard"]' \
     trainer.project_name="verl_${MODEL_NAME}_${DS}" \
-    trainer.experiment_name="sentencepo_ep${EPOCHS}" \
+    trainer.experiment_name="grpo_ep${EPOCHS}" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \
     trainer.total_epochs=$EPOCHS \
-    trainer.max_actor_ckpt_to_keep=1 \
-    trainer.max_critic_ckpt_to_keep=1 \
-    trainer.default_local_dir=$HOME/autodl-tmp/models/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}/verl_checkpoints_sentencepo \
-    "$@" 2>&1 | tee $HOME/autodl-tmp/models/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}/verl_sentencepo.log
+    trainer.default_local_dir=$HOME/autodl-tmp/models/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}/verl_checkpoints_grpo \
+    "$@" 2>&1 | tee $HOME/autodl-tmp/models/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}/verl_grpo.log

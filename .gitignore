@@ -133,3 +133,6 @@ outputs
 
 # models
 models
+
+# flash_attn
+flash_attn-*

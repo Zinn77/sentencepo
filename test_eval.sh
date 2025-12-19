@@ -37,11 +37,11 @@ export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
 # 路径设置
 METHOD_NAME=${METHOD_NAME:-sentencepo} # 方法名称
-DS=${DS:-gsm8k_hasval} # 数据集名称
-MODEL_NAME=${MODEL_NAME:-qwen2_5_7b}
-EPOCHS=${EPOCHS:-1}
+DS=${DS:-math} # 数据集名称
+MODEL_NAME=${MODEL_NAME:-qwen3_4b}
+EPOCHS=${EPOCHS:-5}
 
-TOT_DIR=${TOT_DIR:-$HOME/sentencepo/models/${METHOD_NAME}_${DS}_${MODEL_NAME}_ep${EPOCHS}} # 模型总目录
+TOT_DIR=${TOT_DIR:-$HOME/autodl-tmp/models/${METHOD_NAME}_${DS}_${MODEL_NAME}_ep${EPOCHS}} # 模型总目录
 CKPT_ROOT=${CKPT_ROOT:-${TOT_DIR}/verl_checkpoints_${METHOD_NAME}}
 DATA_PATH=${DATA_PATH:-$HOME/data/${DS}/test.parquet} # 或 $HOME/data/aime-2024/test.parquet
 OUT_PATH=${OUT_PATH:-${TOT_DIR}/eval/${METHOD_NAME}_${DS}_gen.parquet}
@@ -93,24 +93,32 @@ else
 fi
 
 # 2) 使用合并后的模型进行生成
-# 根据需要调整 GPU 配置。对于 4 卡且较小模型，TP=1 通常足够。
-python3 -m verl.trainer.main_generation \
-  trainer.nnodes=1 \
-  trainer.n_gpus_per_node=8 \
-  data.path=${DATA_PATH} \
-  data.prompt_key=prompt \
-  data.n_samples=1 \
-  data.output_path=${OUT_PATH} \
-  model.path=${HF_DIR} \
-  +model.trust_remote_code=True \
-  rollout.temperature=0.0 \
-  rollout.top_k=-1 \
-  rollout.top_p=1.0 \
-  rollout.prompt_length=512 \
-  rollout.response_length=512 \
-  +rollout.pipeline_model_parallel_size=1 \
-  rollout.tensor_model_parallel_size=2 \
-  rollout.gpu_memory_utilization=0.5
+# 如果已经有生成的 parquet，则跳过生成
+if [[ -f "${OUT_PATH}" ]]; then
+  echo "检测到已存在生成文件：${OUT_PATH}（跳过生成）"
+else
+  python3 -m verl.trainer.main_generation \
+    trainer.nnodes=1 \
+    trainer.n_gpus_per_node=4 \
+    data.path=${DATA_PATH} \
+    data.prompt_key=prompt \
+    data.n_samples=4 \
+    data.output_path=${OUT_PATH} \
+    model.path=${HF_DIR} \
+    +model.trust_remote_code=True \
+    rollout.name=vllm \
+    rollout.n=4 \
+    rollout.prompt_length=1024 \
+    rollout.response_length=1024 \
+    +rollout.pipeline_model_parallel_size=1 \
+    rollout.tensor_model_parallel_size=2 \
+    rollout.gpu_memory_utilization=0.2 \
+    rollout.enable_chunked_prefill=True \
+    rollout.max_num_batched_tokens=4096 \
+    rollout.log_prob_micro_batch_size_per_gpu=1
+    # rollout.top_k=-1 \
+    # rollout.top_p=1.0 \
+fi
 
 # 3) 对生成出来的 parquet 进行离线评测（并保存全部输出到日志文件，最后一行是准确率）
 EVAL_DIR=${EVAL_DIR:-${TOT_DIR}/eval}
@@ -124,6 +132,6 @@ python3 -m verl.trainer.main_eval \
   data.response_key=responses \
   data.data_source_key=data_source \
   data.reward_model_key=reward_model \
-  custom_reward_function.path=/root/verl/scripts/eval_reward_wrappers.py \
+  custom_reward_function.path=/root/sentencepo/scripts/eval_reward_wrappers.py \
   custom_reward_function.name=default_eval_fn \
   2>&1 | tee "${EVAL_LOG}"
