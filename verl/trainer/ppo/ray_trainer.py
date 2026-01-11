@@ -45,6 +45,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_sentencepo_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -1031,6 +1032,16 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        sentencepo_monitor_cfg = self.config.trainer.get("sentencepo_monitor", {}) or {}
+        try:
+            sentencepo_monitor_cfg = OmegaConf.to_container(sentencepo_monitor_cfg, resolve=True)
+        except Exception:
+            pass
+        sentencepo_monitor_cfg = sentencepo_monitor_cfg or {}
+        sp_hist_enable = bool(sentencepo_monitor_cfg.get("hist_enable", False))
+        sp_hist_every = int(sentencepo_monitor_cfg.get("hist_every", 0) or 0)
+        sp_hist_max_points = int(sentencepo_monitor_cfg.get("hist_max_points", 2048) or 2048)
+
         self.global_steps = 0
 
         # load checkpoint before doing anything
@@ -1070,6 +1081,7 @@ class RayPPOTrainer:
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1128,10 +1140,7 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    if (
-                        self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-                        == "sentencepo"
-                    ):
+                    if loss_mode == "sentencepo":
                         batch.batch["sentence_ids"] = build_sentence_ids_from_responses(
                             tokenizer=self.tokenizer,
                             responses=batch.batch["responses"],
@@ -1168,6 +1177,17 @@ class RayPPOTrainer:
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
+                        if loss_mode == "sentencepo" and "sentence_ids" in batch.batch:
+                            sentencepo_stats = compute_sentencepo_metrics(
+                                sentence_ids=batch.batch["sentence_ids"],
+                                response_mask=response_masks,
+                                entropys=entropys,
+                                hist_enable=sp_hist_enable,
+                                hist_every=sp_hist_every,
+                                hist_max_points=sp_hist_max_points,
+                                global_step=self.global_steps,
+                            )
+                            metrics.update(sentencepo_stats)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 

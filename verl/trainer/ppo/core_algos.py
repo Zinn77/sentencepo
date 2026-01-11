@@ -30,6 +30,7 @@ from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
+from verl.trainer.ppo.metric_utils import compute_sentencepo_metrics
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
@@ -1048,12 +1049,12 @@ def compute_policy_loss_sentencepo(
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
     sentence_ids: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sentence-level policy loss (SentencePO).
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Sentence-level policy loss (SentencePO) with lightweight metrics.
 
-    SentencePO mirrors GSPO but aggregates importance ratios at the sentence level
-    (grouped by ``sentence_ids``) before broadcasting back to tokens and applying
-    PPO-style clipping.
+    Mirrors GSPO but aggregates importance ratios at the sentence level
+    (grouped by ``sentence_ids``) before PPO-style clipping, and returns
+    a metrics dict for logging SentencePO-specific stats.
 
     Requirements:
     - ``sentence_ids`` must be provided (from actor or config.policy_loss.sentence_ids).
@@ -1078,25 +1079,23 @@ def compute_policy_loss_sentencepo(
     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
 
-    # token-level KL
     negative_approx_kl = log_prob - old_log_prob
 
-    # flatten for grouping while keeping sample separation by offsetting ids
-    bs, seq_len = log_prob.shape
+    # Flatten for grouping; sentence_ids are expected to be already batch-offset upstream
+    bs, _ = log_prob.shape
     flat_kl = negative_approx_kl.view(-1)
     flat_mask = response_mask.view(-1)
     flat_sid = sentence_ids.view(-1)
 
     valid = (flat_mask > 0) & (flat_sid >= 0)
     if not torch.any(valid):
-        raise ValueError("SentencePO: no valid tokens with non-negative sentence_ids found.")
-
-    # offset sentence ids by batch to avoid cross-sample mixing
-    batch_idx = torch.arange(bs, device=log_prob.device).unsqueeze(1).expand(bs, seq_len).reshape(-1)
-    flat_sid_offset = flat_sid + batch_idx * (seq_len + 1)
+        raise ValueError(
+            "SentencePO: no valid tokens with non-negative sentence_ids found; "
+            "check construction of `sentence_ids` and `response_mask`."
+        )
 
     flat_kl_valid = flat_kl[valid]
-    flat_sid_valid = flat_sid_offset[valid]
+    flat_sid_valid = flat_sid[valid]
 
     unique_sid, inv = torch.unique(flat_sid_valid, return_inverse=True)
     num_sent = unique_sid.numel()
@@ -1108,7 +1107,7 @@ def compute_policy_loss_sentencepo(
 
     sent_kl_token = torch.zeros_like(flat_kl)
     sent_kl_token[valid] = sent_kl_mean[inv]
-    sent_kl_token = sent_kl_token.view(bs, seq_len)
+    sent_kl_token = sent_kl_token.view(bs, -1)
 
     log_sentence_importance_ratio = log_prob - log_prob.detach() + sent_kl_token.detach()
     log_sentence_importance_ratio = torch.clamp(log_sentence_importance_ratio, max=10.0)
@@ -1125,10 +1124,28 @@ def compute_policy_loss_sentencepo(
 
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-    # No lower clip in SentencePO; keep shape compatibility
-    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+    pg_metrics: dict[str, Any] = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": 0.0,
+    }
+
+    # Sentence-level monitoring (lightweight, no histograms here)
+    try:
+        sentencepo_metrics = compute_sentencepo_metrics(
+            sentence_ids=sentence_ids,
+            response_mask=response_mask,
+            log_prob=log_prob,
+            old_log_prob=old_log_prob,
+            hist_enable=False,
+        )
+        pg_metrics.update(sentencepo_metrics)
+    except Exception:
+        # Do not break training if monitoring fails
+        pass
+
+    return pg_loss, pg_metrics
 
 
 @register_policy_loss("gpg")

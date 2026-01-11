@@ -488,3 +488,126 @@ def process_validation_metrics(
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
 
     return data_src2var2metric2val
+
+
+def compute_sentencepo_metrics(
+    *,
+    sentence_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    log_prob: torch.Tensor | None = None,
+    old_log_prob: torch.Tensor | None = None,
+    entropys: torch.Tensor | None = None,
+    hist_enable: bool = False,
+    hist_every: int = 0,
+    global_step: int | None = None,
+    hist_max_points: int = 2048,
+) -> dict[str, Any]:
+    """SentencePO 监控：句子数量、长度、比率与熵的统计，可选直方图。"""
+
+    bs, seq_len = sentence_ids.shape
+    device = sentence_ids.device
+
+    offset = torch.arange(bs, device=device).unsqueeze(1) * (seq_len + 1)
+    sid_with_offset = sentence_ids + offset
+
+    valid_mask = (response_mask > 0) & (sentence_ids >= 0)
+    if not torch.any(valid_mask):
+        return {"sentencepo/valid_ratio": 0.0}
+
+    flat_valid = valid_mask.view(-1)
+    flat_sid = sid_with_offset.view(-1)[flat_valid]
+
+    unique_sid, inv = torch.unique(flat_sid, return_inverse=True)
+    ones = torch.ones_like(inv, dtype=torch.float)
+    sent_lens = torch.zeros_like(unique_sid, dtype=torch.float)
+    sent_lens.index_add_(0, inv, ones)
+
+    sentence_counts = []
+    for b in range(bs):
+        row_valid = valid_mask[b]
+        if torch.any(row_valid):
+            n_sent = torch.unique(sentence_ids[b][row_valid]).numel()
+            sentence_counts.append(n_sent)
+
+    def _safe_stat(t: torch.Tensor) -> dict[str, float]:
+        if t.numel() == 0:
+            return {}
+        return {
+            "mean": t.mean().item(),
+            "max": t.max().item(),
+            "min": t.min().item(),
+            "std": t.std(unbiased=False).item() if t.numel() > 1 else 0.0,
+        }
+
+    metrics: dict[str, Any] = {
+        "sentencepo/valid_ratio": flat_valid.float().mean().item(),
+    }
+
+    if sentence_counts:
+        count_tensor = torch.tensor(sentence_counts, device=device, dtype=torch.float)
+        metrics.update({f"sentencepo/count/{k}": v for k, v in _safe_stat(count_tensor).items()})
+
+    metrics.update({f"sentencepo/len/{k}": v for k, v in _safe_stat(sent_lens).items()})
+
+    if log_prob is not None and old_log_prob is not None:
+        neg_kl = log_prob - old_log_prob
+        flat_kl = neg_kl.view(-1)[flat_valid]
+        kl_sum = torch.zeros_like(unique_sid, dtype=flat_kl.dtype)
+        kl_sum.index_add_(0, inv, flat_kl)
+        sent_kl_mean = kl_sum / (sent_lens + 1e-8)
+        sent_ratio = torch.exp(torch.clamp(sent_kl_mean, max=10.0))
+
+        metrics.update({f"sentencepo/ratio/{k}": v for k, v in _safe_stat(sent_ratio).items()})
+
+        per_resp_std = []
+        per_resp_range = []
+        for b in range(bs):
+            row_valid = valid_mask[b]
+            if not torch.any(row_valid):
+                continue
+            row_sid = sid_with_offset[b][row_valid]
+            row_kl = neg_kl[b][row_valid]
+            row_unique, row_inv = torch.unique(row_sid, return_inverse=True)
+            row_len = torch.zeros_like(row_unique, dtype=torch.float)
+            row_len.index_add_(0, row_inv, torch.ones_like(row_inv, dtype=torch.float))
+            row_kl_sum = torch.zeros_like(row_unique, dtype=row_kl.dtype)
+            row_kl_sum.index_add_(0, row_inv, row_kl)
+            row_ratio = torch.exp(torch.clamp(row_kl_sum / (row_len + 1e-8), max=10.0))
+            if row_ratio.numel() > 1:
+                per_resp_std.append(row_ratio.std(unbiased=False))
+                per_resp_range.append((row_ratio.max() - row_ratio.min()))
+            else:
+                per_resp_std.append(torch.tensor(0.0, device=device))
+                per_resp_range.append(torch.tensor(0.0, device=device))
+
+        if per_resp_std:
+            per_resp_std_t = torch.stack(per_resp_std)
+            metrics.update({f"sentencepo/ratio_std_across_sent/{k}": v for k, v in _safe_stat(per_resp_std_t).items()})
+        if per_resp_range:
+            per_resp_range_t = torch.stack(per_resp_range)
+            metrics.update(
+                {f"sentencepo/ratio_range_across_sent/{k}": v for k, v in _safe_stat(per_resp_range_t).items()}
+            )
+
+        if hist_enable and (hist_every == 0 or (global_step is not None and global_step % hist_every == 0)):
+            ratio_vals_cpu = sent_ratio.detach().cpu()
+            if ratio_vals_cpu.numel() > hist_max_points:
+                idx = torch.randperm(ratio_vals_cpu.numel())[:hist_max_points]
+                ratio_vals_cpu = ratio_vals_cpu[idx]
+            metrics["sentencepo/ratio_hist"] = ratio_vals_cpu.numpy()
+
+    if entropys is not None:
+        flat_ent = entropys.view(-1)[flat_valid]
+        ent_sum = torch.zeros_like(unique_sid, dtype=flat_ent.dtype)
+        ent_sum.index_add_(0, inv, flat_ent)
+        sent_entropy = ent_sum / (sent_lens + 1e-8)
+        metrics.update({f"sentencepo/entropy/{k}": v for k, v in _safe_stat(sent_entropy).items()})
+
+        if hist_enable and (hist_every == 0 or (global_step is not None and global_step % hist_every == 0)):
+            ent_cpu = sent_entropy.detach().cpu()
+            if ent_cpu.numel() > hist_max_points:
+                idx = torch.randperm(ent_cpu.numel())[:hist_max_points]
+                ent_cpu = ent_cpu[idx]
+            metrics["sentencepo/entropy_hist"] = ent_cpu.numpy()
+
+    return metrics

@@ -482,8 +482,20 @@ class DataParallelPPOActor(BasePPOActor):
                     if loss_mode == "sentencepo":
                         policy_loss_kwargs["sentence_ids"] = sentence_ids
 
-                    # Compute policy loss (all functions return 4 values)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(**policy_loss_kwargs)
+                    # Compute policy loss; some losses return (loss, metrics_dict), others 4-tuple
+                    policy_loss_out = policy_loss_fn(**policy_loss_kwargs)
+                    if isinstance(policy_loss_out, tuple) and len(policy_loss_out) == 2 and isinstance(
+                        policy_loss_out[1], dict
+                    ):
+                        pg_loss, pg_metrics = policy_loss_out
+                        pg_clipfrac = pg_metrics.get("actor/pg_clipfrac", torch.tensor(0.0, device=pg_loss.device))
+                        ppo_kl = pg_metrics.get("actor/ppo_kl", torch.tensor(0.0, device=pg_loss.device))
+                        pg_clipfrac_lower = pg_metrics.get(
+                            "actor/pg_clipfrac_lower", torch.tensor(0.0, device=pg_loss.device)
+                        )
+                        micro_batch_metrics.update(pg_metrics)
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_out
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -515,9 +527,9 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics.update(
                         {
                             "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
-                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                            "actor/ppo_kl": ppo_kl.detach().item(),
-                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            "actor/pg_clipfrac": float(pg_clipfrac.detach().item()),
+                            "actor/ppo_kl": float(ppo_kl.detach().item()),
+                            "actor/pg_clipfrac_lower": float(pg_clipfrac_lower.detach().item()),
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)
