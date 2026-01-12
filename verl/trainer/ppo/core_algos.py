@@ -1126,9 +1126,9 @@ def compute_policy_loss_sentencepo(
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_metrics: dict[str, Any] = {
-        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-        "actor/ppo_kl": ppo_kl.detach().item(),
-        "actor/pg_clipfrac_lower": 0.0,
+        "actor/pg_clipfrac": pg_clipfrac.detach(),
+        "actor/ppo_kl": ppo_kl.detach(),
+        "actor/pg_clipfrac_lower": torch.tensor(0.0, device=pg_loss.device),
     }
 
     # Sentence-level monitoring (lightweight, no histograms here)

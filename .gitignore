@@ -130,3 +130,6 @@ outputs
 
 # models
 models
+
+# flash_attn and flashinfer
+flash*
