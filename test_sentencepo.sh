@@ -32,6 +32,8 @@ max_response_length=4096
 # max_num_batched_tokens >= max_prompt_length + max_response_length，或开启 enable_chunked_prefill
 max_num_batched_tokens=8192    # 默认 8192
 micro_batch_size=4
+clip_ratio_low=0.01
+clip_ratio_high=0.02
 
 mkdir -p $HOME/autodl-tmp/models/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}
 
@@ -62,6 +64,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.clip_ratio_low=$clip_ratio_low \
+    actor_rollout_ref.actor.clip_ratio_high=$clip_ratio_high \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$micro_batch_size \

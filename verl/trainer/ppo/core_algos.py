@@ -1089,10 +1089,17 @@ def compute_policy_loss_sentencepo(
 
     valid = (flat_mask > 0) & (flat_sid >= 0)
     if not torch.any(valid):
-        raise ValueError(
-            "SentencePO: no valid tokens with non-negative sentence_ids found; "
-            "check construction of `sentence_ids` and `response_mask`."
-        )
+        # Gracefully handle empty/invalid responses to avoid crashing training.
+        # This can happen when the model emits EOS immediately or response_mask is empty.
+        pg_loss = log_prob.sum() * 0.0
+        zero = torch.tensor(0.0, device=log_prob.device)
+        pg_metrics: dict[str, Any] = {
+            "actor/pg_clipfrac": zero,
+            "actor/ppo_kl": zero,
+            "actor/pg_clipfrac_lower": zero,
+            "sentencepo/valid_ratio": 0.0,
+        }
+        return pg_loss, pg_metrics
 
     flat_kl_valid = flat_kl[valid]
     flat_sid_valid = flat_sid[valid]
