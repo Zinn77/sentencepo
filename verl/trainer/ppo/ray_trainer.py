@@ -292,6 +292,16 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == "grpo_sentencepo":
+        grpo_calculation_mask = data.batch["response_mask"]
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -307,6 +317,33 @@ def compute_advantage(
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+
+    # Optional sentence-level semantic advantage fusion (GRPO-style)
+    sentence_adv_cfg = getattr(config, "sentence_adv", None) if config is not None else None
+    if adv_estimator == "grpo_sentencepo":
+        if "sentence_ids" not in data.batch:
+            raise ValueError("sentence_adv is enabled but `sentence_ids` is missing in batch.")
+        token_hidden_states = data.batch.get("token_hidden_states", None)
+        if token_hidden_states is None:
+            raise ValueError(
+                "sentence_adv is enabled but `token_hidden_states` is missing. "
+                "Please enable hidden states in compute_log_prob and ensure fused kernels support it."
+            )
+        if sentence_adv_cfg is None:
+            raise ValueError("sentence_adv config is missing while adv_estimator=grpo_sentencepo.")
+
+        sentence_adv = core_algos.compute_sentence_semantic_advantage(
+            token_hidden_states=token_hidden_states,
+            sentence_ids=data.batch["sentence_ids"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            token_level_rewards=data.batch["token_level_rewards"],
+            config=config,
+        )
+        advantages = data.batch["advantages"] + sentence_adv_cfg.alpha * sentence_adv
+        returns = data.batch["returns"] + sentence_adv_cfg.alpha * sentence_adv
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     return data
@@ -1170,6 +1207,8 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        if self.config.algorithm.adv_estimator == "grpo_sentencepo":
+                            batch.meta_info["return_hidden_states"] = True
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]

@@ -135,6 +135,33 @@ algorithm:
   # Useful for monitoring mismatch before enabling correction
   rollout_is: false
 
+  # Sentence-level semantic advantage configuration (enabled via adv_estimator=grpo_sentencepo)
+  sentence_adv:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.SentenceAdvConfig
+
+    # Deprecated switch (use adv_estimator=grpo_sentencepo instead)
+    enable: false
+
+    # Weight for sentence-level advantage when fusing with GRPO
+    alpha: 0.1
+
+    # Pooling mode for sentence embeddings: mean | last
+    pooling: mean
+
+    # Temperature for logsumexp similarity
+    temperature: 0.2
+
+    # Numerical stability epsilon
+    eps: 1e-6
+
+    # Normalize sentence advantages within group
+    normalize: true
+
+    # Correctness threshold for reward
+    correctness_threshold: 0.5
+
 # config for the trainer
 trainer:
 

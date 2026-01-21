@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "SentenceAdvConfig"]
 
 
 @dataclass
@@ -57,6 +57,30 @@ class FilterGroupsConfig(BaseConfig):
 
 
 @dataclass
+class SentenceAdvConfig(BaseConfig):
+    """Configuration for sentence-level semantic advantage estimation.
+
+    Args:
+        enable (bool): Deprecated. Sentence-level advantage is enabled via
+            algorithm.adv_estimator=grpo_sentencepo.
+        alpha (float): Weight for sentence-level advantage when fused with base advantage.
+        pooling (str): Pooling mode for sentence embedding: "mean" or "last".
+        temperature (float): Temperature for logsumexp similarity.
+        eps (float): Numerical stability epsilon.
+        normalize (bool): Whether to normalize sentence advantages per group.
+        correctness_threshold (float): Threshold for correctness (reward > threshold).
+    """
+
+    enable: bool = False
+    alpha: float = 0.1
+    pooling: str = "mean"
+    temperature: float = 0.2
+    eps: float = 1e-6
+    normalize: bool = True
+    correctness_threshold: float = 0.5
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -81,6 +105,7 @@ class AlgoConfig(BaseConfig):
         rollout_is_veto_threshold (float): Per-token veto threshold for catastrophic outliers.
         rollout_is (bool): Whether to apply IS weights to policy loss. True = apply weights,
             False = compute metrics only (useful for monitoring before enabling correction). Default: False.
+        sentence_adv (SentenceAdvConfig): Sentence-level semantic advantage settings.
     """
 
     gamma: float = 1.0
@@ -103,3 +128,4 @@ class AlgoConfig(BaseConfig):
     # Controls whether to apply IS weights to policy loss (only if rollout_is_threshold is set)
     # True = apply weights to loss, False = compute metrics only (no weight application)
     rollout_is: bool = False
+    sentence_adv: SentenceAdvConfig = field(default_factory=SentenceAdvConfig)

@@ -24,8 +24,11 @@ from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
 
+import math
+
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
@@ -327,6 +330,146 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+def compute_sentence_semantic_advantage(
+    token_hidden_states: torch.Tensor,
+    sentence_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    token_level_rewards: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+) -> torch.Tensor:
+    """Compute sentence-level semantic advantage using logsumexp similarity.
+
+    Args:
+        token_hidden_states: (bs, seq_len, hidden)
+        sentence_ids: (bs, seq_len) sentence ids (>=0 valid, <0 invalid)
+        response_mask: (bs, seq_len) valid response mask
+        index: (bs,) group index (uid)
+        token_level_rewards: (bs, seq_len) token rewards
+        config: AlgoConfig with sentence_adv settings
+
+    Returns:
+        sentence_advantages: (bs, seq_len)
+    """
+    assert config is not None
+    sentence_adv_cfg = getattr(config, "sentence_adv", None)
+    if sentence_adv_cfg is None:
+        return torch.zeros_like(response_mask, dtype=token_hidden_states.dtype, device=token_hidden_states.device)
+
+    if token_hidden_states is None:
+        raise ValueError(
+            "Sentence-level advantage requires `token_hidden_states` in batch. "
+            "Please enable sentence_adv and ensure hidden states are returned in compute_log_prob."
+        )
+
+    device = token_hidden_states.device
+    token_hidden_states = token_hidden_states.float()
+    sentence_ids = sentence_ids.to(device)
+    response_mask = response_mask.to(device)
+
+    bs, seq_len, hidden = token_hidden_states.shape
+    valid = (response_mask > 0) & (sentence_ids >= 0)
+    if not torch.any(valid):
+        return torch.zeros((bs, seq_len), device=device, dtype=token_hidden_states.dtype)
+
+    flat_sid = sentence_ids.view(-1)
+    flat_valid = valid.view(-1)
+    flat_emb = token_hidden_states.view(-1, hidden)
+    flat_sid_valid = flat_sid[flat_valid]
+    flat_emb_valid = flat_emb[flat_valid]
+
+    unique_sid, inv = torch.unique(flat_sid_valid, return_inverse=True)
+    num_sent = unique_sid.numel()
+
+    # compute last token mask for each sentence
+    next_sid = torch.roll(sentence_ids, shifts=-1, dims=1)
+    next_valid = torch.roll(valid, shifts=-1, dims=1)
+    last_pos_mask = torch.zeros_like(valid)
+    last_pos_mask[:, -1] = True
+    boundary = last_pos_mask | (sentence_ids != next_sid) | (~next_valid)
+    last_mask = valid & boundary
+
+    flat_last = last_mask.view(-1)
+    flat_sid_last = flat_sid[flat_last]
+    flat_emb_last = flat_emb[flat_last]
+
+    if flat_sid_last.numel() == 0:
+        return torch.zeros((bs, seq_len), device=device, dtype=token_hidden_states.dtype)
+
+    idx_last = torch.searchsorted(unique_sid, flat_sid_last)
+
+    # sentence embedding pooling
+    pooling = sentence_adv_cfg.pooling
+    eps = sentence_adv_cfg.eps
+    if pooling == "mean":
+        sum_emb = torch.zeros((num_sent, hidden), device=device, dtype=token_hidden_states.dtype)
+        cnt = torch.zeros((num_sent, 1), device=device, dtype=token_hidden_states.dtype)
+        sum_emb.index_add_(0, inv, flat_emb_valid)
+        cnt.index_add_(0, inv, torch.ones_like(flat_sid_valid, dtype=token_hidden_states.dtype).unsqueeze(-1))
+        sent_emb = sum_emb / (cnt + eps)
+    elif pooling == "last":
+        sent_emb = torch.zeros((num_sent, hidden), device=device, dtype=token_hidden_states.dtype)
+        sent_emb.index_copy_(0, idx_last, flat_emb_last)
+    else:
+        raise ValueError(f"Unknown sentence_adv.pooling: {pooling}")
+
+    # map sentence to sample index (use last token positions)
+    flat_sample_idx = torch.arange(bs, device=device).unsqueeze(1).expand(bs, seq_len).reshape(-1)
+    flat_sample_last = flat_sample_idx[flat_last]
+    sent_sample_idx = torch.zeros((num_sent,), device=device, dtype=torch.long)
+    sent_sample_idx.index_copy_(0, idx_last, flat_sample_last)
+
+    # correctness from token-level rewards (sum > threshold)
+    scores = token_level_rewards.to(device).sum(dim=-1)
+    correct = scores > sentence_adv_cfg.correctness_threshold
+
+    # normalize sentence embeddings for cosine similarity
+    sent_emb = F.normalize(sent_emb, dim=-1)
+
+    group_ids = as_torch_index(index, device=device)
+    sent_group = group_ids[sent_sample_idx]
+    num_groups = int(group_ids.max().item()) + 1 if group_ids.numel() > 0 else 0
+
+    log_eps = math.log(eps)
+    tau = sentence_adv_cfg.temperature
+    normalize = sentence_adv_cfg.normalize
+    sent_adv = torch.zeros((num_sent,), device=device, dtype=token_hidden_states.dtype)
+
+    with torch.no_grad():
+        for g in range(num_groups):
+            mask = sent_group == g
+            if not torch.any(mask):
+                continue
+            E = sent_emb[mask]
+            sample_idx_g = sent_sample_idx[mask]
+            pos_mask = correct[sample_idx_g]
+            neg_mask = ~pos_mask
+
+            if torch.any(pos_mask):
+                E_pos = E[pos_mask]
+                sims_pos = E @ E_pos.T
+                log_D_pos = torch.logsumexp(sims_pos / tau, dim=-1)
+            else:
+                log_D_pos = torch.full((E.size(0),), log_eps, device=device, dtype=token_hidden_states.dtype)
+
+            if torch.any(neg_mask):
+                E_neg = E[neg_mask]
+                sims_neg = E @ E_neg.T
+                log_D_neg = torch.logsumexp(sims_neg / tau, dim=-1)
+            else:
+                log_D_neg = torch.full((E.size(0),), log_eps, device=device, dtype=token_hidden_states.dtype)
+
+            A = log_D_pos - log_D_neg
+            if normalize:
+                A = (A - A.mean()) / (A.std(unbiased=False) + eps)
+            sent_adv[mask] = A
+
+    flat_adv = torch.zeros_like(flat_sid, dtype=token_hidden_states.dtype)
+    flat_adv[flat_valid] = sent_adv[inv]
+    sent_adv_tokens = flat_adv.view(bs, seq_len) * response_mask
+    return sent_adv_tokens
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)

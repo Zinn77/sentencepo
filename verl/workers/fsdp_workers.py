@@ -962,13 +962,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
+        # Prefer explicit request from caller via meta_info to avoid relying on top-level config
+        return_hidden_states = bool(data.meta_info.pop("return_hidden_states", False))
+        if not return_hidden_states and hasattr(self.config, "algorithm"):
+            adv_estimator = getattr(self.config.algorithm, "adv_estimator", None)
+            return_hidden_states = adv_estimator == "grpo_sentencepo"
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-            output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
-                meta_info={"temperature": self.config.rollout.temperature},
-            )
+                output, entropys, hidden_states = self.actor.compute_log_prob(
+                    data=data, calculate_entropy=True, return_hidden_states=return_hidden_states
+                )
+            tensors = {"old_log_probs": output, "entropys": entropys}
+            if return_hidden_states and hidden_states is not None:
+                tensors["token_hidden_states"] = hidden_states
+            output = DataProto.from_dict(tensors=tensors, meta_info={"temperature": self.config.rollout.temperature})
 
         output = output.to("cpu")
 
@@ -1004,7 +1011,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            output, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
 
         output = output.to("cpu")

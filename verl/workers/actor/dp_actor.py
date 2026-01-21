@@ -84,12 +84,13 @@ class DataParallelPPOActor(BasePPOActor):
         self.device_name = get_device_name()
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, micro_batch, temperature, calculate_entropy=False, return_hidden_states: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            hidden_states: # (bs, response_len, hidden) or None
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -166,6 +167,9 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                if return_hidden_states:
+                    extra_args["output_hidden_states"] = True
+                    extra_args["return_dict"] = True
 
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
@@ -176,9 +180,12 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
+                hidden_states_rmpad = None
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
+                    if return_hidden_states and hasattr(output, "hidden_states"):
+                        hidden_states_rmpad = output.hidden_states[-1].squeeze(0)
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
@@ -202,6 +209,8 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy_rmpad = torch.utils.checkpoint.checkpoint(
                                 self.compute_entropy_from_logits, logits_rmpad
                             )
+                    if return_hidden_states and hasattr(output, "hidden_states"):
+                        hidden_states_rmpad = output.hidden_states[-1].squeeze(0)
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
@@ -219,10 +228,25 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+                    if return_hidden_states and hidden_states_rmpad is not None:
+                        hidden_states_rmpad = gather_outputs_and_unpad(
+                            hidden_states_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
                 # pad back to (bsz, seqlen)
+                full_hidden_states = None
                 if calculate_entropy:
                     full_entropy = pad_input(
                         hidden_states=entropy_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                if return_hidden_states and hidden_states_rmpad is not None:
+                    full_hidden_states = pad_input(
+                        hidden_states=hidden_states_rmpad,
                         indices=indices,
                         batch=batch_size,
                         seqlen=seqlen,
@@ -235,15 +259,20 @@ class DataParallelPPOActor(BasePPOActor):
                 )
 
                 # only return response part:
+                hidden_states = None
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if return_hidden_states and full_hidden_states is not None:
+                    hidden_states = full_hidden_states[:, -response_length - 1 : -1, :]
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                if return_hidden_states:
+                    extra_args["output_hidden_states"] = True
 
                 output = self.actor_module(
                     input_ids=input_ids,
@@ -254,9 +283,12 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
+                hidden_states = None
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    if return_hidden_states and hasattr(output, "hidden_states"):
+                        hidden_states = output.hidden_states[-1][:, -response_length - 1 : -1, :]
 
                 else:
                     logits = output.logits
@@ -269,8 +301,10 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+                    if return_hidden_states and hasattr(output, "hidden_states"):
+                        hidden_states = output.hidden_states[-1][:, -response_length - 1 : -1, :]
 
-            return entropy, log_probs
+            return entropy, log_probs, hidden_states
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -294,7 +328,9 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(
+        self, data: DataProto, calculate_entropy=False, return_hidden_states: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -332,28 +368,44 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        hidden_states_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                entropy, log_probs, hidden_states = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    return_hidden_states=return_hidden_states,
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if return_hidden_states and hidden_states is not None:
+                hidden_states_lst.append(hidden_states)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+        hidden_states = None
+        if return_hidden_states and len(hidden_states_lst) > 0:
+            hidden_states = torch.concat(hidden_states_lst, dim=0)
+        if return_hidden_states and hidden_states is None:
+            raise ValueError(
+                "return_hidden_states=True but hidden states were not produced. "
+                "Please disable fused kernels or enable output_hidden_states in the model."
+            )
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if return_hidden_states and hidden_states is not None:
+                hidden_states = restore_dynamic_batch(hidden_states, batch_idx_list)
 
-        return log_probs, entropys
+        return log_probs, entropys, hidden_states
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -426,7 +478,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
+                    entropy, log_prob, _ = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
