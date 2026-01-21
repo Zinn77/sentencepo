@@ -38,6 +38,11 @@ sentence_adv_pooling=${SENTENCE_ADV_POOLING:-mean}
 sentence_adv_alpha=${SENTENCE_ADV_ALPHA:-0.1}
 sentence_adv_temperature=${SENTENCE_ADV_TEMPERATURE:-0.2}
 adv_estimator=${ADV_ESTIMATOR:-grpo_sentencepo}
+sentence_adv_metrics=True
+sentence_adv_metrics_max_sentences=${SENTENCE_ADV_METRICS_MAX_SENTENCES:-128}
+sentence_adv_metrics_max_pairs=${SENTENCE_ADV_METRICS_MAX_PAIRS:-4096}
+sentence_adv_metrics_pos_bins=${SENTENCE_ADV_METRICS_POS_BINS:-4}
+sentence_adv_metrics_divergence_threshold=${SENTENCE_ADV_METRICS_DIVERGENCE_THRESHOLD:-0.1}
 
 mkdir -p $HOME/autodl-tmp/models/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}
 
@@ -49,6 +54,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.sentence_adv.pooling=$sentence_adv_pooling \
     algorithm.sentence_adv.alpha=$sentence_adv_alpha \
     algorithm.sentence_adv.temperature=$sentence_adv_temperature \
+    algorithm.sentence_adv.metrics_enable=$sentence_adv_metrics \
+    algorithm.sentence_adv.metrics_max_sentences=$sentence_adv_metrics_max_sentences \
+    algorithm.sentence_adv.metrics_max_pairs=$sentence_adv_metrics_max_pairs \
+    algorithm.sentence_adv.metrics_pos_bins=$sentence_adv_metrics_pos_bins \
+    algorithm.sentence_adv.metrics_divergence_threshold=$sentence_adv_metrics_divergence_threshold \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=128 \

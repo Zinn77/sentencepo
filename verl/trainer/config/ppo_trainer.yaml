@@ -162,6 +162,21 @@ algorithm:
     # Correctness threshold for reward
     correctness_threshold: 0.5
 
+    # Whether to log SentencePO semantic metrics (similarity/divergence, etc.)
+    metrics_enable: false
+
+    # Max sentences per group for similarity metrics sampling
+    metrics_max_sentences: 128
+
+    # Max pairwise similarities sampled per group
+    metrics_max_pairs: 4096
+
+    # Number of position bins for sentence_adv/divergence metrics
+    metrics_pos_bins: 4
+
+    # Threshold for divergence detection
+    metrics_divergence_threshold: 0.1
+
 # config for the trainer
 trainer:
 

@@ -19,10 +19,13 @@ from collections import defaultdict
 from functools import partial
 from typing import Any, Callable
 
+import math
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from verl import DataProto
+from verl.utils import as_torch_index
 from verl.utils.import_utils import deprecated
 
 
@@ -609,5 +612,326 @@ def compute_sentencepo_metrics(
                 idx = torch.randperm(ent_cpu.numel())[:hist_max_points]
                 ent_cpu = ent_cpu[idx]
             metrics["sentencepo/entropy_hist"] = ent_cpu.numpy()
+
+    return metrics
+
+
+def compute_sentencepo_semantic_metrics(
+    *,
+    token_hidden_states: torch.Tensor | None,
+    sentence_ids: torch.Tensor | None,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    token_level_rewards: torch.Tensor,
+    final_advantages: torch.Tensor | None = None,
+    config: Any,
+) -> dict[str, Any]:
+    """Compute SentencePO semantic metrics (similarity, sentence_adv stats, divergence).
+
+    This function is gated by sentence_adv.metrics_enable to avoid overhead.
+    """
+
+    sentence_adv_cfg = getattr(config, "sentence_adv", None)
+    if sentence_adv_cfg is None or not getattr(sentence_adv_cfg, "metrics_enable", False):
+        return {}
+
+    if token_hidden_states is None or sentence_ids is None:
+        return {}
+
+    device = token_hidden_states.device
+    token_hidden_states = token_hidden_states.float()
+    sentence_ids = sentence_ids.to(device)
+    response_mask = response_mask.to(device)
+
+    bs, seq_len, hidden = token_hidden_states.shape
+    valid = (response_mask > 0) & (sentence_ids >= 0)
+    if not torch.any(valid):
+        return {}
+
+    flat_sid_all = sentence_ids.view(-1)
+    flat_valid = valid.view(-1)
+    flat_emb = token_hidden_states.view(-1, hidden)
+
+    flat_sid_valid = flat_sid_all[flat_valid]
+    flat_emb_valid = flat_emb[flat_valid]
+
+    unique_sid, inv = torch.unique(flat_sid_valid, return_inverse=True)
+    num_sent = unique_sid.numel()
+    if num_sent == 0:
+        return {}
+
+    # compute last token mask for each sentence
+    next_sid = torch.roll(sentence_ids, shifts=-1, dims=1)
+    next_valid = torch.roll(valid, shifts=-1, dims=1)
+    last_pos_mask = torch.zeros_like(valid)
+    last_pos_mask[:, -1] = True
+    boundary = last_pos_mask | (sentence_ids != next_sid) | (~next_valid)
+    last_mask = valid & boundary
+
+    flat_last = last_mask.view(-1)
+    flat_sid_last = flat_sid_all[flat_last]
+    flat_emb_last = flat_emb[flat_last]
+
+    if flat_sid_last.numel() == 0:
+        return {}
+
+    idx_last = torch.searchsorted(unique_sid, flat_sid_last)
+
+    # sentence embedding pooling
+    pooling = sentence_adv_cfg.pooling
+    eps = sentence_adv_cfg.eps
+    if pooling == "mean":
+        sum_emb = torch.zeros((num_sent, hidden), device=device, dtype=token_hidden_states.dtype)
+        cnt = torch.zeros((num_sent, 1), device=device, dtype=token_hidden_states.dtype)
+        sum_emb.index_add_(0, inv, flat_emb_valid)
+        cnt.index_add_(0, inv, torch.ones_like(flat_sid_valid, dtype=token_hidden_states.dtype).unsqueeze(-1))
+        sent_emb = sum_emb / (cnt + eps)
+    elif pooling == "last":
+        sent_emb = torch.zeros((num_sent, hidden), device=device, dtype=token_hidden_states.dtype)
+        sent_emb.index_copy_(0, idx_last, flat_emb_last)
+    else:
+        return {}
+
+    # map sentence to sample index (use last token positions)
+    flat_sample_idx = torch.arange(bs, device=device).unsqueeze(1).expand(bs, seq_len).reshape(-1)
+    flat_sample_last = flat_sample_idx[flat_last]
+    sent_sample_idx = torch.zeros((num_sent,), device=device, dtype=torch.long)
+    sent_sample_idx.index_copy_(0, idx_last, flat_sample_last)
+
+    # correctness from token-level rewards (sum > threshold)
+    scores = token_level_rewards.to(device).sum(dim=-1)
+    correct = scores > sentence_adv_cfg.correctness_threshold
+
+    # normalize sentence embeddings for cosine similarity
+    sent_emb = F.normalize(sent_emb, dim=-1)
+
+    group_ids = as_torch_index(index, device=device)
+    sent_group = group_ids[sent_sample_idx]
+    unique_groups = torch.unique(sent_group)
+
+    max_sentences = max(1, int(getattr(sentence_adv_cfg, "metrics_max_sentences", 128)))
+    max_pairs = max(1, int(getattr(sentence_adv_cfg, "metrics_max_pairs", 4096)))
+    pos_bins = max(1, int(getattr(sentence_adv_cfg, "metrics_pos_bins", 4)))
+    div_threshold = float(getattr(sentence_adv_cfg, "metrics_divergence_threshold", 0.1))
+
+    cc_vals: list[torch.Tensor] = []
+    ww_vals: list[torch.Tensor] = []
+    cw_vals: list[torch.Tensor] = []
+
+    sent_adv = torch.zeros((num_sent,), device=device, dtype=token_hidden_states.dtype)
+    sent_correct = correct[sent_sample_idx]
+
+    # local sentence id for position binning
+    sent_local_id = torch.zeros((num_sent,), device=device, dtype=torch.long)
+    sent_local_id.index_copy_(0, idx_last, flat_sid_last - flat_sample_last * (seq_len + 1))
+    sent_local_id = torch.clamp(sent_local_id, min=0)
+
+    max_local_per_sample = torch.zeros((bs,), device=device, dtype=torch.long)
+    for b in range(bs):
+        mask_b = sent_sample_idx == b
+        if torch.any(mask_b):
+            max_local_per_sample[b] = sent_local_id[mask_b].max()
+
+    denom = torch.clamp(max_local_per_sample[sent_sample_idx], min=1).float()
+    rel_pos = sent_local_id.float() / denom
+    bin_idx = torch.clamp((rel_pos * pos_bins).long(), max=pos_bins - 1)
+
+    with torch.no_grad():
+        for g in unique_groups.tolist():
+            mask = sent_group == g
+            if not torch.any(mask):
+                continue
+            E = sent_emb[mask]
+            sample_idx_g = sent_sample_idx[mask]
+            pos_mask = correct[sample_idx_g]
+            neg_mask = ~pos_mask
+
+            if torch.any(pos_mask):
+                E_pos = E[pos_mask]
+                if E_pos.size(0) > max_sentences:
+                    idx = torch.randperm(E_pos.size(0), device=device)[:max_sentences]
+                    E_pos = E_pos[idx]
+            else:
+                E_pos = None
+
+            if torch.any(neg_mask):
+                E_neg = E[neg_mask]
+                if E_neg.size(0) > max_sentences:
+                    idx = torch.randperm(E_neg.size(0), device=device)[:max_sentences]
+                    E_neg = E_neg[idx]
+            else:
+                E_neg = None
+
+            if E_pos is not None and E_pos.size(0) >= 2:
+                sims = E_pos @ E_pos.T
+                tri = torch.triu_indices(sims.size(0), sims.size(1), offset=1, device=device)
+                vals = sims[tri[0], tri[1]]
+                if vals.numel() > max_pairs:
+                    idx = torch.randperm(vals.numel(), device=device)[:max_pairs]
+                    vals = vals.view(-1)[idx]
+                cc_vals.append(vals.view(-1))
+
+            if E_neg is not None and E_neg.size(0) >= 2:
+                sims = E_neg @ E_neg.T
+                tri = torch.triu_indices(sims.size(0), sims.size(1), offset=1, device=device)
+                vals = sims[tri[0], tri[1]]
+                if vals.numel() > max_pairs:
+                    idx = torch.randperm(vals.numel(), device=device)[:max_pairs]
+                    vals = vals.view(-1)[idx]
+                ww_vals.append(vals.view(-1))
+
+            if E_pos is not None and E_neg is not None and E_pos.numel() > 0 and E_neg.numel() > 0:
+                sims = E_pos @ E_neg.T
+                vals = sims.view(-1)
+                if vals.numel() > max_pairs:
+                    idx = torch.randperm(vals.numel(), device=device)[:max_pairs]
+                    vals = vals[idx]
+                cw_vals.append(vals.view(-1))
+
+            # sentence_adv per sentence
+            log_eps = math.log(sentence_adv_cfg.eps)
+            tau = sentence_adv_cfg.temperature
+            if E_pos is not None and E_pos.numel() > 0:
+                sims_pos = E @ E_pos.T
+                log_D_pos = torch.logsumexp(sims_pos / tau, dim=-1)
+            else:
+                log_D_pos = torch.full((E.size(0),), log_eps, device=device, dtype=token_hidden_states.dtype)
+
+            if E_neg is not None and E_neg.numel() > 0:
+                sims_neg = E @ E_neg.T
+                log_D_neg = torch.logsumexp(sims_neg / tau, dim=-1)
+            else:
+                log_D_neg = torch.full((E.size(0),), log_eps, device=device, dtype=token_hidden_states.dtype)
+
+            A = log_D_pos - log_D_neg
+            if sentence_adv_cfg.normalize and A.numel() > 1:
+                A = (A - A.mean()) / (A.std(unbiased=False) + sentence_adv_cfg.eps)
+            sent_adv[mask] = A
+
+    def _mean_p90(values: list[torch.Tensor]) -> dict[str, float]:
+        if not values:
+            return {}
+        all_vals = torch.cat(values)
+        if all_vals.numel() == 0:
+            return {}
+        return {
+            "mean": all_vals.mean().item(),
+            "p90": torch.quantile(all_vals, 0.9).item(),
+        }
+
+    metrics: dict[str, Any] = {}
+    for name, vals in (
+        ("correct_correct", cc_vals),
+        ("wrong_wrong", ww_vals),
+        ("correct_wrong", cw_vals),
+    ):
+        stats = _mean_p90(vals)
+        if stats:
+            metrics[f"sentencepo/sentence_sim/{name}_mean"] = stats["mean"]
+            metrics[f"sentencepo/sentence_sim/{name}_p90"] = stats["p90"]
+
+    if (
+        "sentencepo/sentence_sim/correct_correct_mean" in metrics
+        and "sentencepo/sentence_sim/correct_wrong_mean" in metrics
+    ):
+        metrics["sentencepo/sentence_sim/ratio_cc_vs_cw"] = (
+            metrics["sentencepo/sentence_sim/correct_correct_mean"]
+            - metrics["sentencepo/sentence_sim/correct_wrong_mean"]
+        )
+    if (
+        "sentencepo/sentence_sim/wrong_wrong_mean" in metrics
+        and "sentencepo/sentence_sim/correct_wrong_mean" in metrics
+    ):
+        metrics["sentencepo/sentence_sim/ratio_ww_vs_cw"] = (
+            metrics["sentencepo/sentence_sim/wrong_wrong_mean"]
+            - metrics["sentencepo/sentence_sim/correct_wrong_mean"]
+        )
+
+    # sentence_adv distribution (correct vs wrong)
+    def _adv_stats(vals: torch.Tensor) -> dict[str, float]:
+        if vals.numel() == 0:
+            return {}
+        return {
+            "mean": vals.mean().item(),
+            "std": vals.std(unbiased=False).item() if vals.numel() > 1 else 0.0,
+            "p50": torch.quantile(vals, 0.5).item(),
+            "p90": torch.quantile(vals, 0.9).item(),
+        }
+
+    adv_correct = sent_adv[sent_correct]
+    adv_wrong = sent_adv[~sent_correct]
+    stats_c = _adv_stats(adv_correct)
+    stats_w = _adv_stats(adv_wrong)
+    if stats_c:
+        metrics.update({f"sentencepo/sentence_adv/{k}_correct": v for k, v in stats_c.items()})
+    if stats_w:
+        metrics.update({f"sentencepo/sentence_adv/{k}_wrong": v for k, v in stats_w.items()})
+
+    # sentence_adv by position bins
+    for b in range(pos_bins):
+        mask_bin = bin_idx == b
+        if not torch.any(mask_bin):
+            continue
+        m_correct = mask_bin & sent_correct
+        m_wrong = mask_bin & (~sent_correct)
+        if torch.any(m_correct):
+            metrics[f"sentencepo/sentence_adv/pos_bin_{b}_correct"] = sent_adv[m_correct].mean().item()
+        if torch.any(m_wrong):
+            metrics[f"sentencepo/sentence_adv/pos_bin_{b}_wrong"] = sent_adv[m_wrong].mean().item()
+        if torch.any(m_correct) and torch.any(m_wrong):
+            metrics[f"sentencepo/sentence_adv/pos_bin_{b}_diff"] = (
+                sent_adv[m_correct].mean() - sent_adv[m_wrong].mean()
+            ).item()
+
+    # divergence metrics per group
+    div_first_pos = []
+    div_strength = []
+    for g in unique_groups.tolist():
+        mask = sent_group == g
+        if not torch.any(mask):
+            continue
+        diffs = []
+        first_bin = None
+        for b in range(pos_bins):
+            m_bin = mask & (bin_idx == b)
+            if not torch.any(m_bin):
+                continue
+            m_c = m_bin & sent_correct
+            m_w = m_bin & (~sent_correct)
+            if torch.any(m_c) and torch.any(m_w):
+                diff = (sent_adv[m_c].mean() - sent_adv[m_w].mean()).abs()
+                diffs.append(diff)
+                if first_bin is None and diff.item() > div_threshold:
+                    first_bin = b
+        if diffs:
+            div_strength.append(torch.stack(diffs).mean())
+            if first_bin is not None:
+                div_first_pos.append(torch.tensor((first_bin + 1) / pos_bins, device=device))
+
+    if div_strength:
+        div_strength_t = torch.stack(div_strength)
+        metrics["sentencepo/divergence/strength_mean"] = div_strength_t.mean().item()
+        metrics["sentencepo/divergence/strength_p90"] = torch.quantile(div_strength_t, 0.9).item()
+    if div_first_pos:
+        div_first_pos_t = torch.stack(div_first_pos)
+        metrics["sentencepo/divergence/first_pos_mean"] = div_first_pos_t.mean().item()
+        metrics["sentencepo/divergence/first_pos_p50"] = torch.quantile(div_first_pos_t, 0.5).item()
+        metrics["sentencepo/divergence/first_pos_p90"] = torch.quantile(div_first_pos_t, 0.9).item()
+
+    # advantage decomposition (final = grpo + alpha * sentence_adv)
+    if final_advantages is not None:
+        mask = response_mask > 0
+        denom = mask.sum().clamp(min=1)
+        final_mean = (final_advantages * mask).sum() / denom
+
+        flat_adv = torch.zeros_like(flat_sid_all, dtype=token_hidden_states.dtype)
+        flat_adv[flat_valid] = sent_adv[inv]
+        sent_adv_tokens = flat_adv.view(bs, seq_len) * response_mask
+        sent_adv_mean = sent_adv_tokens.sum() / denom
+
+        alpha = sentence_adv_cfg.alpha
+        metrics["sentencepo/sentence_adv/alpha_term_mean"] = (alpha * sent_adv_mean).item()
+        metrics["sentencepo/sentence_adv/final_adv_mean"] = final_mean.item()
+        metrics["sentencepo/sentence_adv/grpo_term_mean"] = (final_mean - alpha * sent_adv_mean).item()
 
     return metrics

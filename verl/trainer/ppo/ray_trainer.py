@@ -46,6 +46,7 @@ from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_sentencepo_metrics,
+    compute_sentencepo_semantic_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -1291,6 +1292,19 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        if self.config.algorithm.adv_estimator == "grpo_sentencepo":
+                            sentence_metrics = compute_sentencepo_semantic_metrics(
+                                token_hidden_states=batch.batch.get("token_hidden_states", None),
+                                sentence_ids=batch.batch.get("sentence_ids", None),
+                                response_mask=batch.batch["response_mask"],
+                                index=batch.non_tensor_batch["uid"],
+                                token_level_rewards=batch.batch["token_level_rewards"],
+                                final_advantages=batch.batch.get("advantages", None),
+                                config=self.config.algorithm,
+                            )
+                            if sentence_metrics:
+                                metrics.update(sentence_metrics)
 
                     # update critic
                     if self.use_critic:

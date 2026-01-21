@@ -69,6 +69,11 @@ class SentenceAdvConfig(BaseConfig):
         eps (float): Numerical stability epsilon.
         normalize (bool): Whether to normalize sentence advantages per group.
         correctness_threshold (float): Threshold for correctness (reward > threshold).
+        metrics_enable (bool): Whether to log SentencePO semantic metrics.
+        metrics_max_sentences (int): Max sentences per group for similarity metrics sampling.
+        metrics_max_pairs (int): Max pairwise similarities sampled per group.
+        metrics_pos_bins (int): Number of position bins for sentence_adv/divergence metrics.
+        metrics_divergence_threshold (float): Threshold for divergence detection.
     """
 
     enable: bool = False
@@ -78,6 +83,11 @@ class SentenceAdvConfig(BaseConfig):
     eps: float = 1e-6
     normalize: bool = True
     correctness_threshold: float = 0.5
+    metrics_enable: bool = False
+    metrics_max_sentences: int = 128
+    metrics_max_pairs: int = 4096
+    metrics_pos_bins: int = 4
+    metrics_divergence_threshold: float = 0.1
 
 
 @dataclass
