@@ -523,11 +523,13 @@ def compute_sentencepo_metrics(
     sent_lens.index_add_(0, inv, ones)
 
     sentence_counts = []
+    response_lengths = []
     for b in range(bs):
         row_valid = valid_mask[b]
         if torch.any(row_valid):
             n_sent = torch.unique(sentence_ids[b][row_valid]).numel()
             sentence_counts.append(n_sent)
+            response_lengths.append(response_mask[b].sum())
 
     def _safe_stat(t: torch.Tensor) -> dict[str, float]:
         if t.numel() == 0:
@@ -539,6 +541,12 @@ def compute_sentencepo_metrics(
             "std": t.std(unbiased=False).item() if t.numel() > 1 else 0.0,
         }
 
+    def _safe_quantiles(t: torch.Tensor, qs: list[float]) -> dict[str, float]:
+        if t.numel() == 0:
+            return {}
+        qt = torch.quantile(t, torch.tensor(qs, device=t.device, dtype=t.dtype))
+        return {f"p{int(q*100)}": v.item() for q, v in zip(qs, qt, strict=True)}
+
     metrics: dict[str, Any] = {
         "sentencepo/valid_ratio": flat_valid.float().mean().item(),
     }
@@ -546,6 +554,11 @@ def compute_sentencepo_metrics(
     if sentence_counts:
         count_tensor = torch.tensor(sentence_counts, device=device, dtype=torch.float)
         metrics.update({f"sentencepo/count/{k}": v for k, v in _safe_stat(count_tensor).items()})
+
+        # response length stats per sample
+        if response_lengths:
+            length_tensor = torch.stack(response_lengths).to(device=device, dtype=torch.float)
+            metrics.update({f"sentencepo/response_len/{k}": v for k, v in _safe_stat(length_tensor).items()})
 
     metrics.update({f"sentencepo/len/{k}": v for k, v in _safe_stat(sent_lens).items()})
 
@@ -556,6 +569,39 @@ def compute_sentencepo_metrics(
         kl_sum.index_add_(0, inv, flat_kl)
         sent_kl_mean = kl_sum / (sent_lens + 1e-8)
         sent_ratio = torch.exp(torch.clamp(sent_kl_mean, max=10.0))
+
+        # sentence-level delta/kl stats
+        delta_sent = sent_kl_mean
+        kl_sent = -sent_kl_mean
+        metrics.update({f"sentencepo/delta_sent/{k}": v for k, v in _safe_stat(delta_sent).items()})
+        metrics.update({f"sentencepo/delta_sent/{k}": v for k, v in _safe_quantiles(delta_sent, [0.5, 0.9, 0.99]).items()})
+        metrics.update({f"sentencepo/kl_sent/{k}": v for k, v in _safe_stat(kl_sent).items()})
+        metrics.update({f"sentencepo/kl_sent/{k}": v for k, v in _safe_quantiles(kl_sent, [0.5, 0.9, 0.99]).items()})
+
+        # bucketed stats by sentence length (short/mid/long via terciles)
+        if sent_lens.numel() > 0:
+            q1, q2 = torch.quantile(sent_lens, torch.tensor([0.33, 0.66], device=sent_lens.device))
+            buckets = {
+                "short": sent_lens <= q1,
+                "mid": (sent_lens > q1) & (sent_lens <= q2),
+                "long": sent_lens > q2,
+            }
+            for name, mask in buckets.items():
+                if not torch.any(mask):
+                    continue
+                metrics[f"sentencepo/len_bucket/{name}/count"] = mask.float().sum().item()
+                metrics.update(
+                    {
+                        f"sentencepo/delta_sent_bucket/{name}/{k}": v
+                        for k, v in _safe_stat(delta_sent[mask]).items()
+                    }
+                )
+                metrics.update(
+                    {
+                        f"sentencepo/kl_sent_bucket/{name}/{k}": v
+                        for k, v in _safe_stat(kl_sent[mask]).items()
+                    }
+                )
 
         metrics.update({f"sentencepo/ratio/{k}": v for k, v in _safe_stat(sent_ratio).items()})
 
@@ -595,6 +641,18 @@ def compute_sentencepo_metrics(
                 idx = torch.randperm(ratio_vals_cpu.numel())[:hist_max_points]
                 ratio_vals_cpu = ratio_vals_cpu[idx]
             metrics["sentencepo/ratio_hist"] = ratio_vals_cpu.numpy()
+
+            delta_cpu = delta_sent.detach().cpu()
+            if delta_cpu.numel() > hist_max_points:
+                idx = torch.randperm(delta_cpu.numel())[:hist_max_points]
+                delta_cpu = delta_cpu[idx]
+            metrics["sentencepo/delta_sent_hist"] = delta_cpu.numpy()
+
+            kl_cpu = kl_sent.detach().cpu()
+            if kl_cpu.numel() > hist_max_points:
+                idx = torch.randperm(kl_cpu.numel())[:hist_max_points]
+                kl_cpu = kl_cpu[idx]
+            metrics["sentencepo/kl_sent_hist"] = kl_cpu.numpy()
 
     if entropys is not None:
         flat_ent = entropys.view(-1)[flat_valid]

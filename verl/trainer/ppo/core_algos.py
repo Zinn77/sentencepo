@@ -1190,6 +1190,13 @@ def compute_policy_loss_sentencepo(
     pg_clipfrac = clipped.float().mean()
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
+    delta_mean = delta_sent.mean()
+    delta_std = delta_sent.std(unbiased=False)
+    delta_var = delta_sent.var(unbiased=False)
+    kl_sent = -delta_sent
+    kl_mean = kl_sent.mean()
+    kl_std = kl_sent.std(unbiased=False)
+
     pg_metrics: dict[str, Any] = {
         "actor/pg_clipfrac": pg_clipfrac.item(),  # .item() 转成 Python float
         "actor/ppo_kl": ppo_kl.item(),
@@ -1197,6 +1204,15 @@ def compute_policy_loss_sentencepo(
         # SentencePO debug stats
         "sentencepo/sent_clip_fraction": pg_clipfrac.item(),
         "sentencepo/mean_abs_delta_sent": delta_sent.abs().mean().item(),
+        "sentencepo/delta_sent/mean": delta_mean.item(),
+        "sentencepo/delta_sent/std": delta_std.item(),
+        "sentencepo/delta_sent/var": delta_var.item(),
+        "sentencepo/delta_sent/min": delta_sent.min().item(),
+        "sentencepo/delta_sent/max": delta_sent.max().item(),
+        "sentencepo/kl_sent/mean": kl_mean.item(),
+        "sentencepo/kl_sent/std": kl_std.item(),
+        "sentencepo/kl_sent/min": kl_sent.min().item(),
+        "sentencepo/kl_sent/max": kl_sent.max().item(),
         "sentencepo/mean_c_sent": c_sent.mean().item(),
         "sentencepo/ppl_sent_mean": ppl_sent.mean().item(),
         "sentencepo/len_sent_mean": cnt.mean().item(),
