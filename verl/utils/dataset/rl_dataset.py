@@ -110,6 +110,8 @@ class RLHFDataset(Dataset):
         self.video_key = config.get("video_key", "videos")
         # When enabled, generate sentence_ids for prompt+response tokens to support SentencePO loss
         self.enable_sentencepo = config.get("enable_sentencepo", False)
+        # Minimum token count per sentence for SentencePO; short sentences will be merged.
+        self.min_sent_tokens = config.get("min_sent_tokens", config.get("sentencepo_min_sent_tokens", 6))
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
@@ -386,7 +388,11 @@ class RLHFDataset(Dataset):
         return row_dict
 
     def _build_sentence_ids(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Assign sentence ids based on punctuation on valid (attention-masked) tokens."""
+        """Assign sentence ids based on punctuation and newline on valid tokens.
+
+        Sentence boundaries are: English . ? !, Chinese 。 ？ ！, and newline \n.
+        Short sentences (< min_sent_tokens) are merged into the next sentence when possible.
+        """
 
         sentence_ids = torch.full_like(input_ids, fill_value=-1)
 
@@ -394,16 +400,44 @@ class RLHFDataset(Dataset):
         if valid_positions.numel() == 0:
             return sentence_ids
 
-        punctuation_chars = {".", "?", "!", ";", ",", "。", "？", "！", "；"}
+        sentence_end_chars = {".", "?", "!", "。", "？", "！"}
+        min_sent_tokens = max(1, int(self.min_sent_tokens))
 
-        current_sid = 0
+        sentences: list[list[int]] = []
+        current: list[int] = []
         for pos in valid_positions.tolist():
             token_id = int(input_ids[pos].item())
             token_str = self.tokenizer.decode([token_id], skip_special_tokens=False)
 
-            sentence_ids[pos] = current_sid
-            if any(ch in token_str for ch in punctuation_chars):
-                current_sid += 1
+            current.append(pos)
+            if "\n" in token_str or any(ch in token_str for ch in sentence_end_chars):
+                sentences.append(current)
+                current = []
+
+        if current:
+            sentences.append(current)
+
+        if not sentences:
+            return sentence_ids
+
+        # Merge short sentences (< min_sent_tokens). Prefer merging into next; if last, merge into previous.
+        i = 0
+        while i < len(sentences):
+            if len(sentences[i]) < min_sent_tokens and len(sentences) > 1:
+                if i < len(sentences) - 1:
+                    sentences[i + 1] = sentences[i] + sentences[i + 1]
+                    sentences.pop(i)
+                    continue
+                else:
+                    sentences[i - 1] = sentences[i - 1] + sentences[i]
+                    sentences.pop(i)
+                    i = max(i - 1, 0)
+                    continue
+            i += 1
+
+        for sid, sent in enumerate(sentences):
+            for pos in sent:
+                sentence_ids[pos] = sid
 
         return sentence_ids
 

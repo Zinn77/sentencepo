@@ -524,12 +524,17 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     loss.backward()
 
+                    def _to_scalar(x):
+                        if isinstance(x, torch.Tensor):
+                            return float(x.detach().item())
+                        return float(x)
+
                     micro_batch_metrics.update(
                         {
                             "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
-                            "actor/pg_clipfrac": float(pg_clipfrac.detach().item()),
-                            "actor/ppo_kl": float(ppo_kl.detach().item()),
-                            "actor/pg_clipfrac_lower": float(pg_clipfrac_lower.detach().item()),
+                            "actor/pg_clipfrac": _to_scalar(pg_clipfrac),
+                            "actor/ppo_kl": _to_scalar(ppo_kl),
+                            "actor/pg_clipfrac_lower": _to_scalar(pg_clipfrac_lower),
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)

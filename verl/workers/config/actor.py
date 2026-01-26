@@ -35,12 +35,19 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg'.
+        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sentencepo'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        sentencepo_min_sent_tokens (int): Minimum tokens per sentence for SentencePO sentence merging.
+        sentencepo_eps_base (float): Base PPO epsilon (eps_base) for adaptive log-clip radius.
+        sentencepo_lambda_ppl (float): Weight for PPL-based adjustment.
+        sentencepo_lambda_len (float): Weight for length-based adjustment.
+        sentencepo_cmin (float): Lower bound for adaptive clip scale.
+        sentencepo_cmax (float): Upper bound for adaptive clip scale.
+        sentencepo_stats_eps (float): Epsilon for numerical stability in statistics.
     """
 
     loss_mode: str = "vanilla"
@@ -49,6 +56,14 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    # SentencePO adaptive clipping defaults
+    sentencepo_min_sent_tokens: int = 6
+    sentencepo_eps_base: float = 0.2
+    sentencepo_lambda_ppl: float = 0.5
+    sentencepo_lambda_len: float = 0.5
+    sentencepo_cmin: float = 0.5
+    sentencepo_cmax: float = 1.5
+    sentencepo_stats_eps: float = 1e-6
 
 
 @dataclass

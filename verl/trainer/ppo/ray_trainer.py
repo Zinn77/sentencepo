@@ -162,13 +162,14 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-PUNCTUATION_CHARS = {".", "?", "!", ";", ",", "。", "？", "！", "；"}
+PUNCTUATION_CHARS = {".", "?", "!", "。", "？", "！"}
 
 
 def build_sentence_ids_from_responses(
     tokenizer,
     responses: torch.Tensor,
     response_mask: torch.Tensor,
+    min_sent_tokens: int = 6,
 ) -> torch.Tensor:
     """Generate sentence ids for response tokens based on punctuation heuristics.
 
@@ -187,18 +188,48 @@ def build_sentence_ids_from_responses(
     batch_size, seq_len = responses.shape
     sentence_ids = torch.full_like(responses, fill_value=-1, dtype=torch.long)
 
-    for b in range(batch_size):
-        current_sid = 0
-        for idx in range(seq_len):
-            if response_mask[b, idx].item() <= 0:
-                continue
+    min_sent_tokens = max(1, int(min_sent_tokens))
 
+    for b in range(batch_size):
+        valid_positions = (response_mask[b] > 0).nonzero(as_tuple=False).squeeze(-1)
+        if valid_positions.numel() == 0:
+            continue
+
+        sentences: list[list[int]] = []
+        current: list[int] = []
+        for idx in valid_positions.tolist():
             token_id = int(responses[b, idx].item())
             token_str = tokenizer.decode([token_id], skip_special_tokens=False)
-            sentence_ids[b, idx] = current_sid
+            current.append(idx)
 
-            if any(ch in token_str for ch in PUNCTUATION_CHARS):
-                current_sid += 1
+            if "\n" in token_str or any(ch in token_str for ch in PUNCTUATION_CHARS):
+                sentences.append(current)
+                current = []
+
+        if current:
+            sentences.append(current)
+
+        if not sentences:
+            continue
+
+        # Merge short sentences (< min_sent_tokens). Prefer merging into next; if last, merge into previous.
+        i = 0
+        while i < len(sentences):
+            if len(sentences[i]) < min_sent_tokens and len(sentences) > 1:
+                if i < len(sentences) - 1:
+                    sentences[i + 1] = sentences[i] + sentences[i + 1]
+                    sentences.pop(i)
+                    continue
+                else:
+                    sentences[i - 1] = sentences[i - 1] + sentences[i]
+                    sentences.pop(i)
+                    i = max(i - 1, 0)
+                    continue
+            i += 1
+
+        for sid, sent in enumerate(sentences):
+            for idx in sent:
+                sentence_ids[b, idx] = sid
 
     # Offset ids per sample to avoid cross-sample mixing when flattened
     for b in range(batch_size):
@@ -1141,10 +1172,23 @@ class RayPPOTrainer:
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     if loss_mode == "sentencepo":
+                        if hasattr(self.config, "data"):
+                            min_sent_tokens = self.config.data.get(
+                                "min_sent_tokens", self.config.data.get("sentencepo_min_sent_tokens", 6)
+                            )
+                        else:
+                            min_sent_tokens = 6
+                        if hasattr(self.config, "actor_rollout_ref") and hasattr(
+                            self.config.actor_rollout_ref, "actor"
+                        ):
+                            policy_loss_cfg = getattr(self.config.actor_rollout_ref.actor, "policy_loss", None)
+                            if policy_loss_cfg is not None:
+                                min_sent_tokens = getattr(policy_loss_cfg, "sentencepo_min_sent_tokens", min_sent_tokens)
                         batch.batch["sentence_ids"] = build_sentence_ids_from_responses(
                             tokenizer=self.tokenizer,
                             responses=batch.batch["responses"],
                             response_mask=batch.batch["response_mask"],
+                            min_sent_tokens=min_sent_tokens,
                         )
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,

@@ -1050,16 +1050,18 @@ def compute_policy_loss_sentencepo(
     rollout_is_weights: torch.Tensor | None = None,
     sentence_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Sentence-level policy loss (SentencePO) with lightweight metrics.
+    """Sentence-level policy loss (SentencePO) with adaptive clipping.
 
-    Mirrors GSPO but aggregates importance ratios at the sentence level
-    (grouped by ``sentence_ids``) before PPO-style clipping, and returns
-    a metrics dict for logging SentencePO-specific stats.
+    This implementation computes sentence-level log-ratio
+    $\Delta_s = \frac{1}{|s|} \sum_{t \in s} (\log p_\theta - \log p_{\theta_{old}})$,
+    and uses $\rho_s = \exp(\Delta_s)$ for PPO-style clipping.
 
-    Requirements:
-    - ``sentence_ids`` must be provided (from actor or config.policy_loss.sentence_ids).
-      Shape: (bs, seq_len). Tokens to ignore (e.g., padding) should have id < 0.
-    - ``config`` should be an ``ActorConfig`` to access clip ranges.
+    Adaptive log-clip radius $c_s$ is computed from sentence PPL (under old policy)
+    and sentence length, following:
+    $c_s = c_0 \cdot \text{clip}(1 + \lambda_{ppl} z_{ppl} - \lambda_{len} z_{len}, c_{min}, c_{max})$,
+    where $z_{ppl}, z_{len}$ are tanh-normalized statistics over the batch.
+
+    The training objective uses sentence-level averaging per sample.
     """
 
     assert config is not None
@@ -1076,69 +1078,132 @@ def compute_policy_loss_sentencepo(
 
     sentence_ids = sentence_ids.to(log_prob.device)
 
-    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
-    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+    policy_cfg = getattr(config, "policy_loss", None)
+    eps_base = getattr(policy_cfg, "sentencepo_eps_base", 0.2)
+    lambda_ppl = getattr(policy_cfg, "sentencepo_lambda_ppl", 0.5)
+    lambda_len = getattr(policy_cfg, "sentencepo_lambda_len", 0.5)
+    cmin = getattr(policy_cfg, "sentencepo_cmin", 0.5)
+    cmax = getattr(policy_cfg, "sentencepo_cmax", 1.5)
+    stats_eps = getattr(policy_cfg, "sentencepo_stats_eps", 1e-6)
 
     negative_approx_kl = log_prob - old_log_prob
 
     # Flatten for grouping; sentence_ids are expected to be already batch-offset upstream
-    bs, _ = log_prob.shape
-    flat_kl = negative_approx_kl.view(-1)
+    bs, seq_len = log_prob.shape
+    flat_logp = log_prob.reshape(-1)
+    flat_old = old_log_prob.reshape(-1)
     flat_mask = response_mask.view(-1)
     flat_sid = sentence_ids.view(-1)
 
     valid = (flat_mask > 0) & (flat_sid >= 0)
     if not torch.any(valid):
-        # Gracefully handle empty/invalid responses to avoid crashing training.
-        # This can happen when the model emits EOS immediately or response_mask is empty.
         pg_loss = log_prob.sum() * 0.0
-        zero = torch.tensor(0.0, device=log_prob.device)
         pg_metrics: dict[str, Any] = {
-            "actor/pg_clipfrac": zero,
-            "actor/ppo_kl": zero,
-            "actor/pg_clipfrac_lower": zero,
+            "actor/pg_clipfrac": 0.0,  # Python float，不是 tensor
+            "actor/ppo_kl": 0.0,
+            "actor/pg_clipfrac_lower": 0.0,
             "sentencepo/valid_ratio": 0.0,
         }
         return pg_loss, pg_metrics
 
-    flat_kl_valid = flat_kl[valid]
+    flat_logp_valid = flat_logp[valid]
+    flat_old_valid = flat_old[valid]
     flat_sid_valid = flat_sid[valid]
 
     unique_sid, inv = torch.unique(flat_sid_valid, return_inverse=True)
     num_sent = unique_sid.numel()
-    kl_sum = torch.zeros(num_sent, device=log_prob.device, dtype=flat_kl.dtype)
-    cnt = torch.zeros(num_sent, device=log_prob.device, dtype=flat_kl.dtype)
-    kl_sum.index_add_(0, inv, flat_kl_valid)
-    cnt.index_add_(0, inv, torch.ones_like(flat_kl_valid, dtype=flat_kl.dtype))
-    sent_kl_mean = kl_sum / (cnt + 1e-8)
+    ones = torch.ones_like(flat_logp_valid, dtype=flat_logp_valid.dtype)
 
-    sent_kl_token = torch.zeros_like(flat_kl)
-    sent_kl_token[valid] = sent_kl_mean[inv]
-    sent_kl_token = sent_kl_token.view(bs, -1)
+    # Sentence length (token count)
+    cnt = torch.zeros(num_sent, device=log_prob.device, dtype=flat_logp_valid.dtype)
+    cnt.index_add_(0, inv, ones)
 
-    log_sentence_importance_ratio = log_prob - log_prob.detach() + sent_kl_token.detach()
-    log_sentence_importance_ratio = torch.clamp(log_sentence_importance_ratio, max=10.0)
-    sentence_importance_ratio = torch.exp(log_sentence_importance_ratio)
+    # Sentence-level log-ratio: mean(logp_new - logp_old)
+    delta_sum = torch.zeros(num_sent, device=log_prob.device, dtype=flat_logp_valid.dtype)
+    delta_sum.index_add_(0, inv, flat_logp_valid - flat_old_valid)
+    delta_sent = delta_sum / (cnt + 1e-8)
+    rho_sent = torch.exp(delta_sent)
 
-    pg_losses1 = -advantages * sentence_importance_ratio
-    pg_losses2 = -advantages * torch.clamp(sentence_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
-    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+    # Sentence PPL under old policy: exp(-mean(logp_old))
+    old_sum = torch.zeros(num_sent, device=log_prob.device, dtype=flat_logp_valid.dtype)
+    old_sum.index_add_(0, inv, flat_old_valid)
+    old_mean = old_sum / (cnt + 1e-8)
+    ppl_sent = torch.exp(-old_mean)
 
+    # Adaptive log-clip radius based on log(ppl) and log(length)
+    log_ppl = (-old_mean).float()
+    log_len = torch.log(cnt.float().clamp_min(1.0))
+
+    mu_ppl = log_ppl.detach().mean()
+    sigma_ppl = log_ppl.detach().std(unbiased=False).clamp_min(stats_eps)
+    mu_len = log_len.detach().mean()
+    sigma_len = log_len.detach().std(unbiased=False).clamp_min(stats_eps)
+
+    z_ppl = torch.tanh((log_ppl - mu_ppl) / sigma_ppl)
+    z_len = torch.tanh((log_len - mu_len) / sigma_len)
+    scale = (1.0 + lambda_ppl * z_ppl - lambda_len * z_len).clamp(cmin, cmax)
+
+    c0 = torch.log1p(torch.as_tensor(eps_base, device=log_prob.device, dtype=log_prob.dtype))
+    c_sent = c0 * scale.to(log_prob.dtype)
+    lower = torch.exp(-c_sent)
+    upper = torch.exp(c_sent)
+
+    # Sequence-level advantage broadcast to sentences
+    if advantages.dim() == 2:
+        seq_adv = verl_F.masked_mean(advantages, response_mask, axis=-1)
+    else:
+        seq_adv = advantages
+    seq_adv = seq_adv.to(log_prob.dtype)
+
+    # Map each sentence to its batch id
+    flat_indices = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+    flat_batch = (flat_indices // seq_len).to(torch.float32)
+    sent_batch_sum = torch.zeros(num_sent, device=log_prob.device, dtype=flat_batch.dtype)
+    sent_batch_sum.index_add_(0, inv, flat_batch)
+    sent_batch = (sent_batch_sum / cnt).round().long()
+
+    sent_adv = seq_adv[sent_batch]
+
+    obj1 = rho_sent * sent_adv
+    obj2 = torch.clamp(rho_sent, lower, upper) * sent_adv
+    sent_obj = torch.minimum(obj1, obj2)
+
+    # Optional rollout importance weights (sentence-level mean)
     if rollout_is_weights is not None:
-        pg_losses = pg_losses * rollout_is_weights
+        flat_w = rollout_is_weights.view(-1)[valid]
+        w_sum = torch.zeros(num_sent, device=log_prob.device, dtype=flat_w.dtype)
+        w_sum.index_add_(0, inv, flat_w)
+        w_mean = w_sum / (cnt + 1e-8)
+        sent_obj = sent_obj * w_mean
 
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    sent_loss = -sent_obj
 
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    # Sentence-mean per sample, then batch mean
+    loss_sum = torch.zeros(bs, device=log_prob.device, dtype=sent_loss.dtype)
+    sent_count = torch.zeros(bs, device=log_prob.device, dtype=sent_loss.dtype)
+    loss_sum.index_add_(0, sent_batch, sent_loss)
+    sent_count.index_add_(0, sent_batch, torch.ones_like(sent_loss, dtype=sent_loss.dtype))
+    loss_per_sample = loss_sum / (sent_count + 1e-8)
+    pg_loss = loss_per_sample.mean()
+
+    clipped = (rho_sent < lower) | (rho_sent > upper)
+    pg_clipfrac = clipped.float().mean()
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_metrics: dict[str, Any] = {
-        "actor/pg_clipfrac": pg_clipfrac.detach(),
-        "actor/ppo_kl": ppo_kl.detach(),
-        "actor/pg_clipfrac_lower": torch.tensor(0.0, device=pg_loss.device),
+        "actor/pg_clipfrac": pg_clipfrac.item(),  # .item() 转成 Python float
+        "actor/ppo_kl": ppo_kl.item(),
+        "actor/pg_clipfrac_lower": 0.0,
+        # SentencePO debug stats
+        "sentencepo/sent_clip_fraction": pg_clipfrac.item(),
+        "sentencepo/mean_abs_delta_sent": delta_sent.abs().mean().item(),
+        "sentencepo/mean_c_sent": c_sent.mean().item(),
+        "sentencepo/ppl_sent_mean": ppl_sent.mean().item(),
+        "sentencepo/len_sent_mean": cnt.mean().item(),
+        "sentencepo/K_i_mean": sent_count.mean().item(),
     }
 
-    # Sentence-level monitoring (lightweight, no histograms here)
+    # Sentence-level monitoring
     try:
         sentencepo_metrics = compute_sentencepo_metrics(
             sentence_ids=sentence_ids,
@@ -1147,9 +1212,13 @@ def compute_policy_loss_sentencepo(
             old_log_prob=old_log_prob,
             hist_enable=False,
         )
-        pg_metrics.update(sentencepo_metrics)
+        # 确保这些 metrics 也转成 Python 标量
+        for k, v in sentencepo_metrics.items():
+            if isinstance(v, torch.Tensor):
+                pg_metrics[k] = v.item() if v.numel() == 1 else v.cpu().tolist()
+            else:
+                pg_metrics[k] = v
     except Exception:
-        # Do not break training if monitoring fails
         pass
 
     return pg_loss, pg_metrics
