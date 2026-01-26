@@ -19,6 +19,31 @@ from typing import Any
 
 import numpy as np
 
+try:
+    import torch
+except Exception:  # pragma: no cover - torch may be unavailable in some envs
+    torch = None
+
+
+def _to_scalar_list(val: list[Any]) -> list[float]:
+    scalars: list[float] = []
+    for v in val:
+        if torch is not None and isinstance(v, torch.Tensor):
+            if v.numel() == 0:
+                continue
+            scalars.append(float(v.detach().float().mean().item()))
+        elif isinstance(v, np.ndarray):
+            if v.size == 0:
+                continue
+            scalars.append(float(np.mean(v)))
+        elif isinstance(v, (list, tuple)):
+            if len(v) == 0:
+                continue
+            scalars.append(float(np.mean(v)))
+        else:
+            scalars.append(float(v))
+    return scalars
+
 
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
@@ -45,10 +70,14 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
         {"loss": 2.0, "accuracy": 0.8, "max_reward": 8.0, "min_error": 0.05}
     """
     for key, val in metrics.items():
+        val_list = _to_scalar_list(val)
+        if not val_list:
+            metrics[key] = np.nan
+            continue
         if "max" in key:
-            metrics[key] = np.max(val)
+            metrics[key] = np.max(val_list)
         elif "min" in key:
-            metrics[key] = np.min(val)
+            metrics[key] = np.min(val_list)
         else:
-            metrics[key] = np.mean(val)
+            metrics[key] = np.mean(val_list)
     return metrics

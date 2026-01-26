@@ -42,6 +42,7 @@ sentencepo_lambda_len=0.5
 sentencepo_cmin=0.5
 sentencepo_cmax=1.5
 sentencepo_stats_eps=1e-6
+sentencepo_metrics_level=${sentencepo_metrics_level:-full} # 可选 full / basic / off，basic 模式下不记录分句相关指标
 
 # 结果路径
 TOT_DIR=$HOME/autodl-tmp/models_v1-1/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}_epsbase${sentencepo_eps_base}_Lppo${sentencepo_lambda_ppl}_Llen${sentencepo_lambda_len}_cmin${sentencepo_cmin}_cmax${sentencepo_cmax}
@@ -95,6 +96,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.policy_loss.sentencepo_cmin=$sentencepo_cmin \
     +actor_rollout_ref.actor.policy_loss.sentencepo_cmax=$sentencepo_cmax \
     +actor_rollout_ref.actor.policy_loss.sentencepo_stats_eps=$sentencepo_stats_eps \
+    +actor_rollout_ref.actor.policy_loss.sentencepo_metrics_level=$sentencepo_metrics_level \
     actor_rollout_ref.actor.checkpoint.save_contents='["model"]' \
     actor_rollout_ref.actor.checkpoint.load_contents='["model"]' \
     critic.checkpoint.save_contents='["model"]' \

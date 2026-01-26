@@ -1221,12 +1221,16 @@ def compute_policy_loss_sentencepo(
 
     # Sentence-level monitoring
     try:
+        metrics_level = "full"
+        if getattr(config, "policy_loss", None) is not None:
+            metrics_level = getattr(config.policy_loss, "sentencepo_metrics_level", "full")
         sentencepo_metrics = compute_sentencepo_metrics(
             sentence_ids=sentence_ids,
             response_mask=response_mask,
             log_prob=log_prob,
             old_log_prob=old_log_prob,
             hist_enable=False,
+            metrics_level=metrics_level,
         )
         # 确保这些 metrics 也转成 Python 标量
         for k, v in sentencepo_metrics.items():

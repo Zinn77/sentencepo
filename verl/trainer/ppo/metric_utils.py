@@ -501,6 +501,7 @@ def compute_sentencepo_metrics(
     hist_every: int = 0,
     global_step: int | None = None,
     hist_max_points: int = 2048,
+    metrics_level: str = "full",
 ) -> dict[str, Any]:
     """SentencePO 监控：句子数量、长度、比率与熵的统计，可选直方图。"""
 
@@ -547,6 +548,10 @@ def compute_sentencepo_metrics(
         qt = torch.quantile(t, torch.tensor(qs, device=t.device, dtype=t.dtype))
         return {f"p{int(q*100)}": v.item() for q, v in zip(qs, qt, strict=True)}
 
+    level = metrics_level.lower() if isinstance(metrics_level, str) else "full"
+    if level in {"off", "none", "disable", "disabled"}:
+        return {}
+
     metrics: dict[str, Any] = {
         "sentencepo/valid_ratio": flat_valid.float().mean().item(),
     }
@@ -574,34 +579,36 @@ def compute_sentencepo_metrics(
         delta_sent = sent_kl_mean
         kl_sent = -sent_kl_mean
         metrics.update({f"sentencepo/delta_sent/{k}": v for k, v in _safe_stat(delta_sent).items()})
-        metrics.update({f"sentencepo/delta_sent/{k}": v for k, v in _safe_quantiles(delta_sent, [0.5, 0.9, 0.99]).items()})
         metrics.update({f"sentencepo/kl_sent/{k}": v for k, v in _safe_stat(kl_sent).items()})
-        metrics.update({f"sentencepo/kl_sent/{k}": v for k, v in _safe_quantiles(kl_sent, [0.5, 0.9, 0.99]).items()})
 
-        # bucketed stats by sentence length (short/mid/long via terciles)
-        if sent_lens.numel() > 0:
-            q1, q2 = torch.quantile(sent_lens, torch.tensor([0.33, 0.66], device=sent_lens.device))
-            buckets = {
-                "short": sent_lens <= q1,
-                "mid": (sent_lens > q1) & (sent_lens <= q2),
-                "long": sent_lens > q2,
-            }
-            for name, mask in buckets.items():
-                if not torch.any(mask):
-                    continue
-                metrics[f"sentencepo/len_bucket/{name}/count"] = mask.float().sum().item()
-                metrics.update(
-                    {
-                        f"sentencepo/delta_sent_bucket/{name}/{k}": v
-                        for k, v in _safe_stat(delta_sent[mask]).items()
-                    }
-                )
-                metrics.update(
-                    {
-                        f"sentencepo/kl_sent_bucket/{name}/{k}": v
-                        for k, v in _safe_stat(kl_sent[mask]).items()
-                    }
-                )
+        if level == "full":
+            metrics.update({f"sentencepo/delta_sent/{k}": v for k, v in _safe_quantiles(delta_sent, [0.5, 0.9, 0.99]).items()})
+            metrics.update({f"sentencepo/kl_sent/{k}": v for k, v in _safe_quantiles(kl_sent, [0.5, 0.9, 0.99]).items()})
+
+            # bucketed stats by sentence length (short/mid/long via terciles)
+            if sent_lens.numel() > 0:
+                q1, q2 = torch.quantile(sent_lens, torch.tensor([0.33, 0.66], device=sent_lens.device))
+                buckets = {
+                    "short": sent_lens <= q1,
+                    "mid": (sent_lens > q1) & (sent_lens <= q2),
+                    "long": sent_lens > q2,
+                }
+                for name, mask in buckets.items():
+                    if not torch.any(mask):
+                        continue
+                    metrics[f"sentencepo/len_bucket/{name}/count"] = mask.float().sum().item()
+                    metrics.update(
+                        {
+                            f"sentencepo/delta_sent_bucket/{name}/{k}": v
+                            for k, v in _safe_stat(delta_sent[mask]).items()
+                        }
+                    )
+                    metrics.update(
+                        {
+                            f"sentencepo/kl_sent_bucket/{name}/{k}": v
+                            for k, v in _safe_stat(kl_sent[mask]).items()
+                        }
+                    )
 
         metrics.update({f"sentencepo/ratio/{k}": v for k, v in _safe_stat(sent_ratio).items()})
 
@@ -635,24 +642,8 @@ def compute_sentencepo_metrics(
                 {f"sentencepo/ratio_range_across_sent/{k}": v for k, v in _safe_stat(per_resp_range_t).items()}
             )
 
-        if hist_enable and (hist_every == 0 or (global_step is not None and global_step % hist_every == 0)):
-            ratio_vals_cpu = sent_ratio.detach().cpu()
-            if ratio_vals_cpu.numel() > hist_max_points:
-                idx = torch.randperm(ratio_vals_cpu.numel())[:hist_max_points]
-                ratio_vals_cpu = ratio_vals_cpu[idx]
-            metrics["sentencepo/ratio_hist"] = ratio_vals_cpu.numpy()
-
-            delta_cpu = delta_sent.detach().cpu()
-            if delta_cpu.numel() > hist_max_points:
-                idx = torch.randperm(delta_cpu.numel())[:hist_max_points]
-                delta_cpu = delta_cpu[idx]
-            metrics["sentencepo/delta_sent_hist"] = delta_cpu.numpy()
-
-            kl_cpu = kl_sent.detach().cpu()
-            if kl_cpu.numel() > hist_max_points:
-                idx = torch.randperm(kl_cpu.numel())[:hist_max_points]
-                kl_cpu = kl_cpu[idx]
-            metrics["sentencepo/kl_sent_hist"] = kl_cpu.numpy()
+        # Histogram outputs are intentionally omitted here to keep metrics scalar-only
+        # for reducer compatibility.
 
     if entropys is not None:
         flat_ent = entropys.view(-1)[flat_valid]
@@ -661,11 +652,7 @@ def compute_sentencepo_metrics(
         sent_entropy = ent_sum / (sent_lens + 1e-8)
         metrics.update({f"sentencepo/entropy/{k}": v for k, v in _safe_stat(sent_entropy).items()})
 
-        if hist_enable and (hist_every == 0 or (global_step is not None and global_step % hist_every == 0)):
-            ent_cpu = sent_entropy.detach().cpu()
-            if ent_cpu.numel() > hist_max_points:
-                idx = torch.randperm(ent_cpu.numel())[:hist_max_points]
-                ent_cpu = ent_cpu[idx]
-            metrics["sentencepo/entropy_hist"] = ent_cpu.numpy()
+        # Histogram outputs are intentionally omitted here to keep metrics scalar-only
+        # for reducer compatibility.
 
     return metrics
