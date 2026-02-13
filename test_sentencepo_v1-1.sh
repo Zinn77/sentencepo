@@ -36,21 +36,35 @@ clip_ratio_low=0.1
 clip_ratio_high=0.1
 # sentencepo_v1-1 超参数
 sentencepo_min_sent_tokens=6
-sentencepo_eps_base=0.2
-sentencepo_lambda_ppl=0.5
-sentencepo_lambda_len=0.5
+sentencepo_eps_base=0.01
+sentencepo_lambda_ppl=0
+sentencepo_lambda_len=0
 sentencepo_cmin=0.5
 sentencepo_cmax=1.5
 sentencepo_stats_eps=1e-6
 sentencepo_metrics_level=${sentencepo_metrics_level:-full} # 可选 full / basic / off，basic 模式下不记录分句相关指标
 
+# 诊断与可视化开关
+enable_sentence_analysis=${enable_sentence_analysis:-true}
+sentence_analysis_max_samples=${sentence_analysis_max_samples:-4096}
+sentence_analysis_top_k=${sentence_analysis_top_k:-3}
+sentence_analysis_group_by_uid=${sentence_analysis_group_by_uid:-true}
+response_len_bins=${response_len_bins:-"[128,256,512,1024,2048,4096]"}
+prompt_len_bins=${prompt_len_bins:-"[64,128,256,512,1024]"}
+analysis_response_len_bins=${analysis_response_len_bins:-"[128,256,512,1024,2048,4096]"}
+analysis_sentence_count_bins=${analysis_sentence_count_bins:-"[4,8,16,32,64]"}
+analysis_max_sentence_len_bins=${analysis_max_sentence_len_bins:-"[32,64,128,256,512]"}
+
 # 结果路径
-TOT_DIR=$HOME/autodl-tmp/models_v1-1/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}_epsbase${sentencepo_eps_base}_Lppo${sentencepo_lambda_ppl}_Llen${sentencepo_lambda_len}_cmin${sentencepo_cmin}_cmax${sentencepo_cmax}
+TOT_DIR=$HOME/autodl-tmp/models_v1-1-metrics/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}_epsbase${sentencepo_eps_base}_Lppo${sentencepo_lambda_ppl}_Llen${sentencepo_lambda_len}_cmin${sentencepo_cmin}_cmax${sentencepo_cmax}
 mkdir -p $TOT_DIR
+mkdir -p $TOT_DIR/verl_checkpoints_sentencepo
 
-cd $HOME/sentencepo_v1-1
+sentence_analysis_dir=${sentence_analysis_dir:-"$TOT_DIR/sentence_analysis"}
 
-PYTHONPATH=$HOME/sentencepo_v1-1 \
+cd $HOME/sentencepo_v1-1-metrics
+
+PYTHONPATH=$HOME/sentencepo_v1-1-metrics \
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
@@ -73,8 +87,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.clip_ratio_low=$clip_ratio_low \
     actor_rollout_ref.actor.clip_ratio_high=$clip_ratio_high \
     actor_rollout_ref.rollout.enforce_eager=False \
@@ -82,12 +96,12 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$micro_batch_size \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$max_num_batched_tokens \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$micro_batch_size \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.policy_loss.loss_mode=sentencepo \
     +actor_rollout_ref.actor.policy_loss.sentencepo_min_sent_tokens=$sentencepo_min_sent_tokens \
     +actor_rollout_ref.actor.policy_loss.sentencepo_eps_base=$sentencepo_eps_base \
@@ -97,6 +111,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.policy_loss.sentencepo_cmax=$sentencepo_cmax \
     +actor_rollout_ref.actor.policy_loss.sentencepo_stats_eps=$sentencepo_stats_eps \
     +actor_rollout_ref.actor.policy_loss.sentencepo_metrics_level=$sentencepo_metrics_level \
+    +actor_rollout_ref.actor.policy_loss.analysis_bins.response_len_bins=$analysis_response_len_bins \
+    +actor_rollout_ref.actor.policy_loss.analysis_bins.sentence_count_bins=$analysis_sentence_count_bins \
+    +actor_rollout_ref.actor.policy_loss.analysis_bins.max_sentence_len_bins=$analysis_max_sentence_len_bins \
     actor_rollout_ref.actor.checkpoint.save_contents='["model"]' \
     actor_rollout_ref.actor.checkpoint.load_contents='["model"]' \
     critic.checkpoint.save_contents='["model"]' \
@@ -105,11 +122,18 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","tensorboard"]' \
     trainer.project_name="verl_${MODEL_NAME}_${DS}" \
-    trainer.experiment_name="sentencepo_ep${EPOCHS}" \
+    trainer.experiment_name="sentencepo_ep${EPOCHS}_epsbase${sentencepo_eps_base}_Lppo${sentencepo_lambda_ppl}_Llen${sentencepo_lambda_len}_cmin${sentencepo_cmin}_cmax${sentencepo_cmax}" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=$EPOCHS \
     trainer.default_local_dir=$TOT_DIR/verl_checkpoints_sentencepo \
+    +trainer.response_len_bins=$response_len_bins \
+    +trainer.prompt_len_bins=$prompt_len_bins \
+    +trainer.sentence_analysis.enable=$enable_sentence_analysis \
+    +trainer.sentence_analysis.max_samples=$sentence_analysis_max_samples \
+    +trainer.sentence_analysis.top_k=$sentence_analysis_top_k \
+    +trainer.sentence_analysis.group_by_uid=$sentence_analysis_group_by_uid \
+    +trainer.sentence_analysis.dir=$sentence_analysis_dir \
     "$@" 2>&1 | tee $TOT_DIR/verl_sentencepo.log

@@ -49,6 +49,7 @@ class PolicyLossConfig(BaseConfig):
         sentencepo_cmax (float): Upper bound for adaptive clip scale.
         sentencepo_stats_eps (float): Epsilon for numerical stability in statistics.
         sentencepo_metrics_level (str): SentencePO metrics level: "full", "basic", or "off".
+        analysis_bins (dict): Optional bins for analysis (response_len_bins, sentence_count_bins, max_sentence_len_bins).
     """
 
     loss_mode: str = "vanilla"
@@ -66,6 +67,7 @@ class PolicyLossConfig(BaseConfig):
     sentencepo_cmax: float = 1.5
     sentencepo_stats_eps: float = 1e-6
     sentencepo_metrics_level: str = "full"
+    analysis_bins: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

@@ -32,16 +32,27 @@ max_response_length=4096
 # max_num_batched_tokens >= max_prompt_length + max_response_length，或开启 enable_chunked_prefill
 max_num_batched_tokens=8192    # 默认 8192
 micro_batch_size=4
-clip_ratio_low=0.0003
-clip_ratio_high=0.0004
 
-TOT_DIR=$HOME/autodl-tmp/models_v1-1/gspo_${DS}_${MODEL_NAME}_ep${EPOCHS}
+# 诊断与可视化开关
+enable_sentence_analysis=${enable_sentence_analysis:-true}
+sentence_analysis_max_samples=${sentence_analysis_max_samples:-4096}
+sentence_analysis_top_k=${sentence_analysis_top_k:-3}
+sentence_analysis_group_by_uid=${sentence_analysis_group_by_uid:-true}
+response_len_bins=${response_len_bins:-"[128,256,512,1024,2048,4096]"}
+prompt_len_bins=${prompt_len_bins:-"[64,128,256,512,1024]"}
+analysis_response_len_bins=${analysis_response_len_bins:-"[128,256,512,1024,2048,4096]"}
+analysis_sentence_count_bins=${analysis_sentence_count_bins:-"[4,8,16,32,64]"}
+analysis_max_sentence_len_bins=${analysis_max_sentence_len_bins:-"[32,64,128,256,512]"}
+
+TOT_DIR=$HOME/autodl-tmp/models_v1-1-metrics/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}
 mkdir -p $TOT_DIR
-mkdir -p $TOT_DIR/verl_checkpoints_gspo
+mkdir -p $TOT_DIR/verl_checkpoints_grpo
 
-cd $HOME/sentencepo_v1-1
+sentence_analysis_dir=${sentence_analysis_dir:-"$TOT_DIR/sentence_analysis"}
 
-PYTHONPATH=$HOME/sentencepo_v1-1 \
+cd $HOME/sentencepo_v1-1-metrics
+
+PYTHONPATH=$HOME/sentencepo_v1-1-metrics \
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
@@ -63,12 +74,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.policy_loss.loss_mode=gspo \
-    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.actor.clip_ratio_low=$clip_ratio_low \
-    actor_rollout_ref.actor.clip_ratio_high=$clip_ratio_high \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$micro_batch_size \
@@ -80,6 +87,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_num_batched_tokens=$max_num_batched_tokens \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$micro_batch_size \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    +actor_rollout_ref.actor.policy_loss.analysis_bins.response_len_bins=$analysis_response_len_bins \
+    +actor_rollout_ref.actor.policy_loss.analysis_bins.sentence_count_bins=$analysis_sentence_count_bins \
+    +actor_rollout_ref.actor.policy_loss.analysis_bins.max_sentence_len_bins=$analysis_max_sentence_len_bins \
     actor_rollout_ref.actor.checkpoint.save_contents='["model"]' \
     actor_rollout_ref.actor.checkpoint.load_contents='["model"]' \
     critic.checkpoint.save_contents='["model"]' \
@@ -88,11 +98,18 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","tensorboard"]' \
     trainer.project_name="verl_${MODEL_NAME}_${DS}" \
-    trainer.experiment_name="gspo_ep${EPOCHS}" \
+    trainer.experiment_name="grpo_ep${EPOCHS}" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=$EPOCHS \
-    trainer.default_local_dir=$TOT_DIR/verl_checkpoints_gspo \
-    "$@" 2>&1 | tee $TOT_DIR/verl_gspo.log
+    trainer.default_local_dir=$TOT_DIR/verl_checkpoints_grpo \
+    +trainer.response_len_bins=$response_len_bins \
+    +trainer.prompt_len_bins=$prompt_len_bins \
+    +trainer.sentence_analysis.enable=$enable_sentence_analysis \
+    +trainer.sentence_analysis.max_samples=$sentence_analysis_max_samples \
+    +trainer.sentence_analysis.top_k=$sentence_analysis_top_k \
+    +trainer.sentence_analysis.group_by_uid=$sentence_analysis_group_by_uid \
+    +trainer.sentence_analysis.dir=$sentence_analysis_dir \
+    "$@" 2>&1 | tee $TOT_DIR/verl_grpo.log
