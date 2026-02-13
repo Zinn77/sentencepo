@@ -502,14 +502,21 @@ def compute_sentencepo_metrics(
     global_step: int | None = None,
     hist_max_points: int = 2048,
     metrics_level: str = "full",
+    prefix: str = "sentencepo",
 ) -> dict[str, Any]:
-    """SentencePO 监控：句子数量、长度、比率与熵的统计，可选直方图。"""
+    """Sentence-level监控：句子数量、长度、比率与熵的统计，可选直方图。"""
 
     bs, seq_len = sentence_ids.shape
     device = sentence_ids.device
 
-    offset = torch.arange(bs, device=device).unsqueeze(1) * (seq_len + 1)
-    sid_with_offset = sentence_ids + offset
+    sid_max = sentence_ids.max().item() if sentence_ids.numel() > 0 else -1
+    sid_min = sentence_ids.min().item() if sentence_ids.numel() > 0 else -1
+    needs_offset = sid_max < seq_len and sid_min >= -1
+    if needs_offset:
+        offset = torch.arange(bs, device=device).unsqueeze(1) * (seq_len + 1)
+        sid_with_offset = sentence_ids + offset
+    else:
+        sid_with_offset = sentence_ids
 
     valid_mask = (response_mask > 0) & (sentence_ids >= 0)
     if not torch.any(valid_mask):
@@ -552,20 +559,21 @@ def compute_sentencepo_metrics(
     if level in {"off", "none", "disable", "disabled"}:
         return {}
 
+    pfx = prefix.strip("/") if isinstance(prefix, str) and prefix else "sentencepo"
     metrics: dict[str, Any] = {
-        "sentencepo/valid_ratio": flat_valid.float().mean().item(),
+        f"{pfx}/valid_ratio": flat_valid.float().mean().item(),
     }
 
     if sentence_counts:
         count_tensor = torch.tensor(sentence_counts, device=device, dtype=torch.float)
-        metrics.update({f"sentencepo/count/{k}": v for k, v in _safe_stat(count_tensor).items()})
+        metrics.update({f"{pfx}/count/{k}": v for k, v in _safe_stat(count_tensor).items()})
 
         # response length stats per sample
         if response_lengths:
             length_tensor = torch.stack(response_lengths).to(device=device, dtype=torch.float)
-            metrics.update({f"sentencepo/response_len/{k}": v for k, v in _safe_stat(length_tensor).items()})
+            metrics.update({f"{pfx}/response_len/{k}": v for k, v in _safe_stat(length_tensor).items()})
 
-    metrics.update({f"sentencepo/len/{k}": v for k, v in _safe_stat(sent_lens).items()})
+        metrics.update({f"{pfx}/len/{k}": v for k, v in _safe_stat(sent_lens).items()})
 
     if log_prob is not None and old_log_prob is not None:
         neg_kl = log_prob - old_log_prob
@@ -578,12 +586,16 @@ def compute_sentencepo_metrics(
         # sentence-level delta/kl stats
         delta_sent = sent_kl_mean
         kl_sent = -sent_kl_mean
-        metrics.update({f"sentencepo/delta_sent/{k}": v for k, v in _safe_stat(delta_sent).items()})
-        metrics.update({f"sentencepo/kl_sent/{k}": v for k, v in _safe_stat(kl_sent).items()})
+        metrics.update({f"{pfx}/delta_sent/{k}": v for k, v in _safe_stat(delta_sent).items()})
+        metrics.update({f"{pfx}/kl_sent/{k}": v for k, v in _safe_stat(kl_sent).items()})
 
         if level == "full":
-            metrics.update({f"sentencepo/delta_sent/{k}": v for k, v in _safe_quantiles(delta_sent, [0.5, 0.9, 0.99]).items()})
-            metrics.update({f"sentencepo/kl_sent/{k}": v for k, v in _safe_quantiles(kl_sent, [0.5, 0.9, 0.99]).items()})
+            metrics.update(
+                {f"{pfx}/delta_sent/{k}": v for k, v in _safe_quantiles(delta_sent, [0.5, 0.9, 0.99]).items()}
+            )
+            metrics.update(
+                {f"{pfx}/kl_sent/{k}": v for k, v in _safe_quantiles(kl_sent, [0.5, 0.9, 0.99]).items()}
+            )
 
             # bucketed stats by sentence length (short/mid/long via terciles)
             if sent_lens.numel() > 0:
@@ -596,21 +608,61 @@ def compute_sentencepo_metrics(
                 for name, mask in buckets.items():
                     if not torch.any(mask):
                         continue
-                    metrics[f"sentencepo/len_bucket/{name}/count"] = mask.float().sum().item()
+                    metrics[f"{pfx}/len_bucket/{name}/count"] = mask.float().sum().item()
                     metrics.update(
                         {
-                            f"sentencepo/delta_sent_bucket/{name}/{k}": v
+                            f"{pfx}/delta_sent_bucket/{name}/{k}": v
                             for k, v in _safe_stat(delta_sent[mask]).items()
                         }
                     )
                     metrics.update(
                         {
-                            f"sentencepo/kl_sent_bucket/{name}/{k}": v
+                            f"{pfx}/kl_sent_bucket/{name}/{k}": v
                             for k, v in _safe_stat(kl_sent[mask]).items()
                         }
                     )
 
-        metrics.update({f"sentencepo/ratio/{k}": v for k, v in _safe_stat(sent_ratio).items()})
+        metrics.update({f"{pfx}/ratio/{k}": v for k, v in _safe_stat(sent_ratio).items()})
+
+        # sentence-level max |log ratio| (detect local explosions)
+        num_sent = unique_sid.numel()
+        flat_logp_valid = log_prob.view(-1)[flat_valid]
+        flat_old_valid = old_log_prob.view(-1)[flat_valid]
+        abs_logratio = (flat_logp_valid - flat_old_valid).abs()
+        try:
+            max_abs = torch.full((num_sent,), -1e9, device=abs_logratio.device, dtype=abs_logratio.dtype)
+            max_abs = max_abs.scatter_reduce(0, inv, abs_logratio, reduce="amax", include_self=True)
+        except Exception:
+            max_abs = torch.zeros(num_sent, device=abs_logratio.device, dtype=abs_logratio.dtype)
+            for idx in range(num_sent):
+                m = inv == idx
+                if torch.any(m):
+                    max_abs[idx] = abs_logratio[m].max()
+        metrics.update({f"{pfx}/ratio_max_abs_log/{k}": v for k, v in _safe_stat(max_abs).items()})
+        if level == "full":
+            metrics.update(
+                {f"{pfx}/ratio_max_abs_log/{k}": v for k, v in _safe_quantiles(max_abs, [0.5, 0.9, 0.99]).items()}
+            )
+
+        # sentence-level PPL (under old policy)
+        old_sum = torch.zeros_like(unique_sid, dtype=flat_old_valid.dtype)
+        old_sum.index_add_(0, inv, flat_old_valid)
+        old_mean = old_sum / (sent_lens + 1e-8)
+        ppl_sent = torch.exp(-old_mean)
+        metrics.update({f"{pfx}/ppl/{k}": v for k, v in _safe_stat(ppl_sent).items()})
+        if level == "full":
+            metrics.update({f"{pfx}/ppl/{k}": v for k, v in _safe_quantiles(ppl_sent, [0.5, 0.9, 0.99]).items()})
+
+        # sentence length share within response
+        sent_batch = (unique_sid // (seq_len + 1)).clamp(min=0, max=bs - 1).long()
+        if response_lengths:
+            response_len_t = torch.stack(response_lengths).to(device=device, dtype=sent_lens.dtype)
+            sent_share = sent_lens / (response_len_t[sent_batch] + 1e-8)
+            metrics.update({f"{pfx}/len_share/{k}": v for k, v in _safe_stat(sent_share).items()})
+            if level == "full":
+                metrics.update(
+                    {f"{pfx}/len_share/{k}": v for k, v in _safe_quantiles(sent_share, [0.5, 0.9, 0.99]).items()}
+                )
 
         per_resp_std = []
         per_resp_range = []
@@ -635,11 +687,11 @@ def compute_sentencepo_metrics(
 
         if per_resp_std:
             per_resp_std_t = torch.stack(per_resp_std)
-            metrics.update({f"sentencepo/ratio_std_across_sent/{k}": v for k, v in _safe_stat(per_resp_std_t).items()})
+            metrics.update({f"{pfx}/ratio_std_across_sent/{k}": v for k, v in _safe_stat(per_resp_std_t).items()})
         if per_resp_range:
             per_resp_range_t = torch.stack(per_resp_range)
             metrics.update(
-                {f"sentencepo/ratio_range_across_sent/{k}": v for k, v in _safe_stat(per_resp_range_t).items()}
+                {f"{pfx}/ratio_range_across_sent/{k}": v for k, v in _safe_stat(per_resp_range_t).items()}
             )
 
         # Histogram outputs are intentionally omitted here to keep metrics scalar-only
@@ -650,7 +702,7 @@ def compute_sentencepo_metrics(
         ent_sum = torch.zeros_like(unique_sid, dtype=flat_ent.dtype)
         ent_sum.index_add_(0, inv, flat_ent)
         sent_entropy = ent_sum / (sent_lens + 1e-8)
-        metrics.update({f"sentencepo/entropy/{k}": v for k, v in _safe_stat(sent_entropy).items()})
+        metrics.update({f"{pfx}/entropy/{k}": v for k, v in _safe_stat(sent_entropy).items()})
 
         # Histogram outputs are intentionally omitted here to keep metrics scalar-only
         # for reducer compatibility.

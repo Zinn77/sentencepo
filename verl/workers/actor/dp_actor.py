@@ -20,6 +20,8 @@ Single Process Actor
 import logging
 import os
 
+import numpy as np
+
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -83,13 +85,44 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+    def _find_last_transformer_block(self) -> nn.Module | None:
+        module = getattr(self.actor_module, "_fsdp_wrapped_module", self.actor_module)
+        candidates = (
+            ("model", "layers"),
+            ("model", "h"),
+            ("transformer", "h"),
+            ("transformer", "layers"),
+            ("transformer", "blocks"),
+            ("gpt_neox", "layers"),
+            ("decoder", "layers"),
+        )
+        for path in candidates:
+            obj = module
+            ok = True
+            for attr in path:
+                if not hasattr(obj, attr):
+                    ok = False
+                    break
+                obj = getattr(obj, attr)
+            if not ok:
+                continue
+            if isinstance(obj, (nn.ModuleList, list, tuple)) and len(obj) > 0:
+                return obj[-1]
+        return None
+
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        return_hidden_states: bool = False,
+        return_last_hidden_state_only: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Returns:
-            entropy: # (bs, response_len)
-            log_probs: # (bs, response_len)
+            entropy: (bs, response_len) or None
+            log_probs: (bs, response_len)
+            hidden_states: (bs, response_len, hidden) or None
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -104,22 +137,39 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
+            hidden_states = None
+            hook_handle = None
+            last_hidden = None
+            use_hook = False
             if position_ids.dim() == 3:  # qwen2vl mrope
-                position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
+                position_ids = position_ids.transpose(0, 1)
+
+            if return_hidden_states and return_last_hidden_state_only:
+                block = self._find_last_transformer_block()
+                if block is not None:
+                    use_hook = True
+
+                    def _hook(_module, _inputs, output):
+                        nonlocal last_hidden
+                        if isinstance(output, tuple):
+                            last_hidden = output[0]
+                        else:
+                            last_hidden = output
+
+                    hook_handle = block.register_forward_hook(_hook)
 
             if self.use_remove_padding:
                 input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
                     input_ids.unsqueeze(-1), attention_mask
-                )  # input_ids_rmpad (total_nnz, ...)
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                )
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
 
-                # unpad the position_ids to align the rotary
                 if position_ids.dim() == 3:
                     position_ids_rmpad = (
                         index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
                         .transpose(0, 1)
                         .unsqueeze(1)
-                    )  # (4, bsz, seqlen) -> (4, 1, bsz * seqlen)
+                    )
                 else:
                     position_ids_rmpad = index_first_axis(
                         rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
@@ -132,16 +182,13 @@ class DataParallelPPOActor(BasePPOActor):
                         input_ids, attention_mask, position_ids, cu_seqlens, multi_modal_inputs
                     )
 
-                # for compute the log_prob
-                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
 
-                # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
                     is_vlm_model = hasattr(
                         getattr(self.actor_module, "module", self.actor_module).config, "vision_config"
                     )
                     if is_vlm_model:
-                        # vlm model's inputs will be sliced after embedding
                         input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
                             input_ids_rmpad,
                             position_ids_rmpad=position_ids_rmpad,
@@ -159,13 +206,14 @@ class DataParallelPPOActor(BasePPOActor):
                         sp_size=self.ulysses_sequence_parallel_size,
                     )
 
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
+                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
 
-                # only pass input_ids and position_ids to enable flash_attn_varlen
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                if return_hidden_states and not use_hook:
+                    extra_args["output_hidden_states"] = True
 
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
@@ -174,17 +222,18 @@ class DataParallelPPOActor(BasePPOActor):
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
-                )  # prevent model thinks we are generating
+                )
 
+                hidden_states_rmpad = None
                 if self.use_fused_kernels:
-                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
-                    entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
-
+                    log_probs = output.log_probs.squeeze(0)
+                    if calculate_entropy:
+                        entropy_rmpad = output.entropy.squeeze(0)
+                    if return_hidden_states and not use_hook and hasattr(output, "hidden_states"):
+                        hidden_states_rmpad = output.hidden_states[-1].squeeze(0)
                 else:
-                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                    logits_rmpad = output.logits.squeeze(0)
                     logits_rmpad.div_(temperature)
-
-                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
                         inplace_backward = False
@@ -193,19 +242,20 @@ class DataParallelPPOActor(BasePPOActor):
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
                     )
-
-                    # compute entropy
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
-                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
                         else:
                             entropy_rmpad = torch.utils.checkpoint.checkpoint(
                                 self.compute_entropy_from_logits, logits_rmpad
                             )
+                    if return_hidden_states and not use_hook and hasattr(output, "hidden_states"):
+                        hidden_states_rmpad = output.hidden_states[-1].squeeze(0)
 
-                # gather log_prob if sp > 1
+                if return_hidden_states and use_hook and last_hidden is not None:
+                    hidden_states_rmpad = last_hidden.squeeze(0)
+
                 if self.use_ulysses_sp:
-                    # gather and unpad for the ulysses sp
                     log_probs = gather_outputs_and_unpad(
                         log_probs,
                         gather_dim=0,
@@ -219,10 +269,24 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
-                # pad back to (bsz, seqlen)
+                    if return_hidden_states and hidden_states_rmpad is not None:
+                        hidden_states_rmpad = gather_outputs_and_unpad(
+                            hidden_states_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+
                 if calculate_entropy:
                     full_entropy = pad_input(
                         hidden_states=entropy_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                if return_hidden_states and hidden_states_rmpad is not None:
+                    full_hidden_states = pad_input(
+                        hidden_states=hidden_states_rmpad,
                         indices=indices,
                         batch=batch_size,
                         seqlen=seqlen,
@@ -234,16 +298,18 @@ class DataParallelPPOActor(BasePPOActor):
                     seqlen=seqlen,
                 )
 
-                # only return response part:
                 if calculate_entropy:
-                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
-                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
-
-            else:  # not using rmpad and no ulysses sp
+                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
+                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
+                if return_hidden_states and hidden_states_rmpad is not None:
+                    hidden_states = full_hidden_states[:, -response_length - 1 : -1, :]
+            else:
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                if return_hidden_states and not use_hook:
+                    extra_args["output_hidden_states"] = True
 
                 output = self.actor_module(
                     input_ids=input_ids,
@@ -252,29 +318,33 @@ class DataParallelPPOActor(BasePPOActor):
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
-                )  # prevent model thinks we are generating
+                )
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
-                    entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
-
+                    entropy = output.entropy[:, -response_length - 1 : -1] if calculate_entropy else None
                 else:
                     logits = output.logits
-
                     logits.div_(temperature)
-                    logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    logits = logits[:, -response_length - 1 : -1, :]
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
-                            entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                            entropy = verl_F.entropy_from_logits(logits)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+                if return_hidden_states and not use_hook and hasattr(output, "hidden_states"):
+                    hidden_states = output.hidden_states[-1][:, -response_length - 1 : -1, :]
+                if return_hidden_states and use_hook and last_hidden is not None:
+                    hidden_states = last_hidden[:, -response_length - 1 : -1, :]
 
-            return entropy, log_probs
+            if hook_handle is not None:
+                hook_handle.remove()
+
+            return entropy, log_probs, hidden_states
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
-
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):
@@ -294,7 +364,7 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False, return_hidden_states: bool = False):
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -318,6 +388,7 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        return_last_hidden_state_only = bool(data.meta_info.get("return_last_hidden_state_only", False))
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -332,28 +403,40 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        hidden_states_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                entropy, log_probs, hidden_states = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    return_hidden_states=return_hidden_states,
+                    return_last_hidden_state_only=return_last_hidden_state_only,
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if return_hidden_states and hidden_states is not None:
+                hidden_states_lst.append(hidden_states)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
 
+        hidden_states = None
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if return_hidden_states and hidden_states_lst:
+                hidden_states = restore_dynamic_batch(torch.concat(hidden_states_lst, dim=0), batch_idx_list)
+        elif return_hidden_states and hidden_states_lst:
+            hidden_states = torch.concat(hidden_states_lst, dim=0)
 
-        return log_probs, entropys
+        return log_probs, entropys, hidden_states
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -380,6 +463,9 @@ class DataParallelPPOActor(BasePPOActor):
         # Optional pre-computed sentence ids for sentencepo loss
         if "sentence_ids" in data.batch.keys():
             select_keys.append("sentence_ids")
+        # Optional token-level scores for CPR/CNR and clip-by stats
+        if "token_level_scores" in data.batch.keys():
+            select_keys.append("token_level_scores")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -426,7 +512,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
+                    entropy, log_prob, _ = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
@@ -496,6 +582,293 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics.update(pg_metrics)
                     else:
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_out
+
+                    # Clip diagnostics + CPR/CNR + correct/wrong response stats (for GSPO/GRPO/vanilla)
+                    if loss_mode in {"gspo", "vanilla", "grpo"}:
+                        response_mask_bool = response_mask.to(bool)
+                        neg_kl = log_prob - old_log_prob
+                        clip_ratio_low = (
+                            self.config.clip_ratio_low if self.config.clip_ratio_low is not None else self.config.clip_ratio
+                        )
+                        clip_ratio_high = (
+                            self.config.clip_ratio_high if self.config.clip_ratio_high is not None else self.config.clip_ratio
+                        )
+
+                        def _init_clip_by_keys(metrics_dict, prefix, bins, label):
+                            prev = 0
+                            for b in bins:
+                                metrics_dict[f"{prefix}/clip_by_{label}/{prev+1}-{b}/rate"] = 0.0
+                                metrics_dict[f"{prefix}/clip_by_{label}/{prev+1}-{b}/cpr"] = 0.0
+                                metrics_dict[f"{prefix}/clip_by_{label}/{prev+1}-{b}/cnr"] = 0.0
+                                prev = b
+                            metrics_dict[f"{prefix}/clip_by_{label}/{prev+1}+/rate"] = 0.0
+                            metrics_dict[f"{prefix}/clip_by_{label}/{prev+1}+/cpr"] = 0.0
+                            metrics_dict[f"{prefix}/clip_by_{label}/{prev+1}+/cnr"] = 0.0
+
+                        diag_metrics = {}
+                        if loss_mode == "gspo":
+                            prefix = "actor/gspo"
+                            diag_metrics.update(
+                                {
+                                    f"{prefix}/seq_ratio/mean": 0.0,
+                                    f"{prefix}/seq_ratio/max": 0.0,
+                                    f"{prefix}/seq_ratio/min": 0.0,
+                                    f"{prefix}/seq_ratio/std": 0.0,
+                                    f"{prefix}/clipfrac_seq": 0.0,
+                                    f"{prefix}/clip_reason_low": 0.0,
+                                    f"{prefix}/clip_reason_high": 0.0,
+                                    f"{prefix}/max_abs_logratio_token/mean": 0.0,
+                                    f"{prefix}/max_abs_logratio_token/max": 0.0,
+                                }
+                            )
+                        else:
+                            prefix = "actor/grpo"
+                            diag_metrics.update(
+                                {
+                                    f"{prefix}/clipfrac_resp": 0.0,
+                                    f"{prefix}/clip_reason_low": 0.0,
+                                    f"{prefix}/clip_reason_high": 0.0,
+                                    f"{prefix}/max_abs_logratio_token/mean": 0.0,
+                                    f"{prefix}/max_abs_logratio_token/max": 0.0,
+                                }
+                            )
+
+                        # CPR/CNR and correct vs wrong response stats keys (always present)
+                        diag_metrics.update(
+                            {
+                                f"{prefix}/cpr": 0.0,
+                                f"{prefix}/cnr": 0.0,
+                                f"{prefix}/resp_len_mean_correct": 0.0,
+                                f"{prefix}/resp_len_mean_wrong": 0.0,
+                                f"{prefix}/resp_ppl_mean_correct": 0.0,
+                                f"{prefix}/resp_ppl_mean_wrong": 0.0,
+                                f"{prefix}/resp_entropy_mean_correct": 0.0,
+                                f"{prefix}/resp_entropy_mean_wrong": 0.0,
+                                f"{prefix}/sent_count_mean_correct": 0.0,
+                                f"{prefix}/sent_count_mean_wrong": 0.0,
+                                f"{prefix}/max_sent_len_mean_correct": 0.0,
+                                f"{prefix}/max_sent_len_mean_wrong": 0.0,
+                                f"{prefix}/sent_ppl_mean_correct": 0.0,
+                                f"{prefix}/sent_ppl_mean_wrong": 0.0,
+                                f"{prefix}/sent_ppl_var_correct": 0.0,
+                                f"{prefix}/sent_ppl_var_wrong": 0.0,
+                                f"{prefix}/sent_ent_mean_correct": 0.0,
+                                f"{prefix}/sent_ent_mean_wrong": 0.0,
+                                f"{prefix}/sent_ent_var_correct": 0.0,
+                                f"{prefix}/sent_ent_var_wrong": 0.0,
+                            }
+                        )
+
+                        # Prepare clip-by buckets (always present)
+                        bins_cfg = getattr(self.config, "policy_loss", None)
+                        bins_cfg = bins_cfg.get("analysis_bins", {}) if bins_cfg is not None else {}
+                        resp_bins = bins_cfg.get("response_len_bins", [64, 128, 256, 512])
+                        sent_bins = bins_cfg.get("sentence_count_bins", [4, 8, 16, 32])
+                        max_sent_bins = bins_cfg.get("max_sentence_len_bins", [32, 64, 128, 256])
+                        _init_clip_by_keys(diag_metrics, prefix, resp_bins, "resp_len")
+                        _init_clip_by_keys(diag_metrics, prefix, sent_bins, "sent_count")
+                        _init_clip_by_keys(diag_metrics, prefix, max_sent_bins, "max_sent_len")
+
+                        if loss_mode == "gspo":
+                            seq_lens = response_mask_bool.sum(-1).clamp(min=1)
+                            seq_log_ratio = (neg_kl * response_mask_bool).sum(-1) / seq_lens
+                            seq_ratio = torch.exp(seq_log_ratio)
+                            clip_resp = (seq_ratio < (1 - clip_ratio_low)) | (seq_ratio > (1 + clip_ratio_high))
+                            clip_reason_low = seq_ratio < (1 - clip_ratio_low)
+                            clip_reason_high = seq_ratio > (1 + clip_ratio_high)
+
+                            diag_metrics.update(
+                                {
+                                    f"{prefix}/seq_ratio/mean": seq_ratio.mean().detach().item(),
+                                    f"{prefix}/seq_ratio/max": seq_ratio.max().detach().item(),
+                                    f"{prefix}/seq_ratio/min": seq_ratio.min().detach().item(),
+                                    f"{prefix}/seq_ratio/std": seq_ratio.std(unbiased=False).detach().item(),
+                                    f"{prefix}/clipfrac_seq": clip_resp.float().mean().detach().item(),
+                                    f"{prefix}/clip_reason_low": clip_reason_low.float().mean().detach().item(),
+                                    f"{prefix}/clip_reason_high": clip_reason_high.float().mean().detach().item(),
+                                    f"{prefix}/max_abs_logratio_token/mean": neg_kl.abs()
+                                    .masked_select(response_mask_bool)
+                                    .mean()
+                                    .detach()
+                                    .item(),
+                                    f"{prefix}/max_abs_logratio_token/max": neg_kl.abs()
+                                    .masked_select(response_mask_bool)
+                                    .max()
+                                    .detach()
+                                    .item(),
+                                }
+                            )
+                        else:
+                            ratio = torch.exp(neg_kl)
+                            resp_any_low = torch.any((ratio < (1 - clip_ratio_low)) & response_mask_bool, dim=-1)
+                            resp_any_high = torch.any((ratio > (1 + clip_ratio_high)) & response_mask_bool, dim=-1)
+                            clip_resp = resp_any_low | resp_any_high
+                            clip_reason_low = resp_any_low
+                            clip_reason_high = resp_any_high
+
+                            diag_metrics.update(
+                                {
+                                    f"{prefix}/clipfrac_resp": clip_resp.float().mean().detach().item(),
+                                    f"{prefix}/clip_reason_low": clip_reason_low.float().mean().detach().item(),
+                                    f"{prefix}/clip_reason_high": clip_reason_high.float().mean().detach().item(),
+                                    f"{prefix}/max_abs_logratio_token/mean": neg_kl.abs()
+                                    .masked_select(response_mask_bool)
+                                    .mean()
+                                    .detach()
+                                    .item(),
+                                    f"{prefix}/max_abs_logratio_token/max": neg_kl.abs()
+                                    .masked_select(response_mask_bool)
+                                    .max()
+                                    .detach()
+                                    .item(),
+                                }
+                            )
+
+                        # CPR/CNR and correct vs wrong response stats (requires token_level_scores)
+                        if "token_level_scores" in model_inputs:
+                            rewards = (model_inputs["token_level_scores"] * response_mask_bool).sum(-1)
+                            is_correct = rewards > 0
+                            is_wrong = ~is_correct
+
+                            clipped = clip_resp
+                            clipped_count = clipped.float().sum().clamp(min=1)
+                            cpr = (is_correct & clipped).float().sum() / clipped_count
+                            cnr = (is_wrong & clipped).float().sum() / clipped_count
+
+                            diag_metrics.update(
+                                {
+                                    f"{prefix}/cpr": cpr.detach().item(),
+                                    f"{prefix}/cnr": cnr.detach().item(),
+                                }
+                            )
+
+                            # Response-level aggregates (requires sentence_ids)
+                            if "sentence_ids" in model_inputs:
+                                resp_len = response_mask_bool.sum(-1).float()
+                                resp_ppl = torch.exp(-(old_log_prob * response_mask_bool).sum(-1) / resp_len.clamp(min=1))
+                                resp_ent = None
+                                if entropy is not None:
+                                    resp_ent = (entropy * response_mask_bool).sum(-1) / resp_len.clamp(min=1)
+
+                                sentence_ids = model_inputs["sentence_ids"]
+                                sent_counts = []
+                                max_sent_lens = []
+                                sent_ppl_mean = []
+                                sent_ppl_var = []
+                                sent_ent_mean = []
+                                sent_ent_var = []
+
+                                for i in range(sentence_ids.shape[0]):
+                                    row_mask = response_mask_bool[i]
+                                    row_sid = sentence_ids[i]
+                                    row_valid = row_mask & (row_sid >= 0)
+                                    if not torch.any(row_valid):
+                                        sent_counts.append(0)
+                                        max_sent_lens.append(0)
+                                        sent_ppl_mean.append(0.0)
+                                        sent_ppl_var.append(0.0)
+                                        sent_ent_mean.append(0.0)
+                                        sent_ent_var.append(0.0)
+                                        continue
+
+                                    sids = torch.unique(row_sid[row_valid])
+                                    sent_counts.append(int(sids.numel()))
+                                    sent_lens = []
+                                    sent_ppl = []
+                                    sent_ent = []
+                                    for sid in sids.tolist():
+                                        m = (row_sid == sid) & row_mask
+                                        sent_lens.append(int(m.sum().item()))
+                                        sent_ppl.append(float(torch.exp(-old_log_prob[i][m].mean()).item()))
+                                        if entropy is not None:
+                                            sent_ent.append(float(entropy[i][m].mean().item()))
+                                    max_sent_lens.append(max(sent_lens) if sent_lens else 0)
+                                    if sent_ppl:
+                                        sent_ppl_mean.append(float(np.mean(sent_ppl)))
+                                        sent_ppl_var.append(float(np.var(sent_ppl)))
+                                    else:
+                                        sent_ppl_mean.append(0.0)
+                                        sent_ppl_var.append(0.0)
+                                    if sent_ent:
+                                        sent_ent_mean.append(float(np.mean(sent_ent)))
+                                        sent_ent_var.append(float(np.var(sent_ent)))
+                                    else:
+                                        sent_ent_mean.append(0.0)
+                                        sent_ent_var.append(0.0)
+
+                                sent_counts_t = torch.tensor(sent_counts, device=resp_len.device, dtype=resp_len.dtype)
+                                max_sent_lens_t = torch.tensor(max_sent_lens, device=resp_len.device, dtype=resp_len.dtype)
+
+                                def _group_stats(mask, name):
+                                    if torch.any(mask):
+                                        diag_metrics[f"{prefix}/resp_len_mean_{name}"] = (
+                                            resp_len[mask].mean().detach().item()
+                                        )
+                                        diag_metrics[f"{prefix}/resp_ppl_mean_{name}"] = (
+                                            resp_ppl[mask].mean().detach().item()
+                                        )
+                                        if resp_ent is not None:
+                                            diag_metrics[f"{prefix}/resp_entropy_mean_{name}"] = (
+                                                resp_ent[mask].mean().detach().item()
+                                            )
+                                        diag_metrics[f"{prefix}/sent_count_mean_{name}"] = (
+                                            sent_counts_t[mask].mean().detach().item()
+                                        )
+                                        diag_metrics[f"{prefix}/max_sent_len_mean_{name}"] = (
+                                            max_sent_lens_t[mask].mean().detach().item()
+                                        )
+                                        diag_metrics[f"{prefix}/sent_ppl_mean_{name}"] = float(
+                                            np.mean(np.array(sent_ppl_mean)[mask.cpu().numpy()])
+                                        )
+                                        diag_metrics[f"{prefix}/sent_ppl_var_{name}"] = float(
+                                            np.mean(np.array(sent_ppl_var)[mask.cpu().numpy()])
+                                        )
+                                        diag_metrics[f"{prefix}/sent_ent_mean_{name}"] = float(
+                                            np.mean(np.array(sent_ent_mean)[mask.cpu().numpy()])
+                                        )
+                                        diag_metrics[f"{prefix}/sent_ent_var_{name}"] = float(
+                                            np.mean(np.array(sent_ent_var)[mask.cpu().numpy()])
+                                        )
+
+                                _group_stats(is_correct, "correct")
+                                _group_stats(is_wrong, "wrong")
+
+                                def _bin_metrics(values, bins, label):
+                                    prev = 0
+                                    for b in bins:
+                                        m = (values > prev) & (values <= b)
+                                        if torch.any(m):
+                                            clip_m = clipped & m
+                                            denom = clip_m.float().sum().clamp(min=1)
+                                            diag_metrics[f"{prefix}/clip_by_{label}/{prev+1}-{b}/rate"] = (
+                                                clip_m.float().mean().detach().item()
+                                            )
+                                            diag_metrics[f"{prefix}/clip_by_{label}/{prev+1}-{b}/cpr"] = (
+                                                ((is_correct & clip_m).float().sum() / denom).detach().item()
+                                            )
+                                            diag_metrics[f"{prefix}/clip_by_{label}/{prev+1}-{b}/cnr"] = (
+                                                ((is_wrong & clip_m).float().sum() / denom).detach().item()
+                                            )
+                                        prev = b
+                                    m = values > prev
+                                    if torch.any(m):
+                                        clip_m = clipped & m
+                                        denom = clip_m.float().sum().clamp(min=1)
+                                        diag_metrics[f"{prefix}/clip_by_{label}/{prev+1}+/rate"] = (
+                                            clip_m.float().mean().detach().item()
+                                        )
+                                        diag_metrics[f"{prefix}/clip_by_{label}/{prev+1}+/cpr"] = (
+                                            ((is_correct & clip_m).float().sum() / denom).detach().item()
+                                        )
+                                        diag_metrics[f"{prefix}/clip_by_{label}/{prev+1}+/cnr"] = (
+                                            ((is_wrong & clip_m).float().sum() / denom).detach().item()
+                                        )
+
+                                _bin_metrics(resp_len, resp_bins, "resp_len")
+                                _bin_metrics(sent_counts_t, sent_bins, "sent_count")
+                                _bin_metrics(max_sent_lens_t, max_sent_bins, "max_sent_len")
+
+                        micro_batch_metrics.update(diag_metrics)
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

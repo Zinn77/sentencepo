@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "SentenceAdvConfig"]
 
 
 @dataclass
@@ -54,6 +54,33 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class SentenceAdvConfig(BaseConfig):
+    """Configuration for sentence-level semantic advantage.
+
+    Args:
+        enable (bool): Enable sentence-level semantic advantage.
+        alpha (float): Weight to fuse sentence advantage into base advantages.
+        temperature (float): Softmax temperature for similarity.
+        pooling (str): Sentence embedding pooling: "mean" or "last".
+        normalize (bool): Whether to z-normalize sentence advantages within bucket.
+        eps (float): Numerical stability epsilon.
+        correctness_threshold (float): Threshold on sequence reward to define correctness.
+        bucket_count (int): Number of relative-position buckets per response.
+        metrics_enable (bool): Whether to emit extra semantic metrics.
+    """
+
+    enable: bool = False
+    alpha: float = 0.1
+    temperature: float = 0.1
+    pooling: str = "last"
+    normalize: bool = True
+    eps: float = 1e-8
+    correctness_threshold: float = 0.0
+    bucket_count: int = 3
+    metrics_enable: bool = True
 
 
 @dataclass
@@ -103,3 +130,4 @@ class AlgoConfig(BaseConfig):
     # Controls whether to apply IS weights to policy loss (only if rollout_is_threshold is set)
     # True = apply weights to loss, False = compute metrics only (no weight application)
     rollout_is: bool = False
+    sentence_adv: Optional[SentenceAdvConfig] = None

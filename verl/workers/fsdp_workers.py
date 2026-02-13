@@ -962,11 +962,100 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
+        return_hidden_states = bool(data.meta_info.pop("return_hidden_states", False))
+        pool_only = bool(data.meta_info.pop("sentence_adv_pool_only", False))
+        if not return_hidden_states and hasattr(self.config, "algorithm"):
+            sentence_adv_cfg = getattr(self.config.algorithm, "sentence_adv", None)
+            return_hidden_states = bool(getattr(sentence_adv_cfg, "enable", False))
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys, hidden_states = self.actor.compute_log_prob(
+                    data=data, calculate_entropy=True, return_hidden_states=return_hidden_states
+                )
+            tensors = {"log_probs": output, "old_log_probs": output, "entropys": entropys}
+            if return_hidden_states and hidden_states is not None:
+                sentence_ids = data.batch.get("sentence_ids", None)
+                response_mask = data.batch.get("response_mask", None)
+                sentence_adv_cfg = getattr(getattr(self.config, "algorithm", None), "sentence_adv", None)
+                pooling = getattr(sentence_adv_cfg, "pooling", None)
+                eps = float(getattr(sentence_adv_cfg, "eps", 1e-8))
+
+                def _pool_sentence_embeddings(
+                    hs: torch.Tensor,
+                    sids: torch.Tensor,
+                    mask: torch.Tensor,
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+                    device = hs.device
+                    sids = sids.to(device)
+                    mask = mask.to(device)
+                    bs, seq_len, hidden = hs.shape
+
+                    valid = (mask > 0) & (sids >= 0)
+                    if not torch.any(valid):
+                        return None
+
+                    flat_sid = sids.view(-1)
+                    flat_valid = valid.view(-1)
+                    flat_sid_valid = flat_sid[flat_valid]
+                    if flat_sid_valid.numel() == 0:
+                        return None
+
+                    unique_sid, inv = torch.unique(flat_sid_valid, return_inverse=True)
+                    num_sent = unique_sid.numel()
+                    if num_sent == 0:
+                        return None
+
+                    next_sid = torch.roll(sids, shifts=-1, dims=1)
+                    next_valid = torch.roll(valid, shifts=-1, dims=1)
+                    last_pos_mask = torch.zeros_like(valid)
+                    last_pos_mask[:, -1] = True
+                    boundary = last_pos_mask | (sids != next_sid) | (~next_valid)
+                    last_mask = valid & boundary
+
+                    flat_last = last_mask.view(-1)
+                    flat_sid_last = flat_sid[flat_last]
+                    if flat_sid_last.numel() == 0:
+                        return None
+
+                    idx_last = torch.searchsorted(unique_sid, flat_sid_last)
+
+                    if pooling == "mean":
+                        flat_emb = hs.view(-1, hidden)
+                        flat_emb_valid = flat_emb[flat_valid]
+                        sum_emb = torch.zeros((num_sent, hidden), device=device, dtype=hs.dtype)
+                        cnt = torch.zeros((num_sent, 1), device=device, dtype=hs.dtype)
+                        sum_emb.index_add_(0, inv, flat_emb_valid)
+                        cnt.index_add_(0, inv, torch.ones((flat_emb_valid.size(0), 1), device=device, dtype=hs.dtype))
+                        sent_emb = sum_emb / (cnt + eps)
+                    elif pooling == "last":
+                        flat_emb = hs.view(-1, hidden)
+                        flat_emb_last = flat_emb[flat_last]
+                        sent_emb = torch.zeros((num_sent, hidden), device=device, dtype=hs.dtype)
+                        sent_emb.index_copy_(0, idx_last, flat_emb_last)
+                    else:
+                        return None
+
+                    flat_sample_idx = torch.arange(bs, device=device).unsqueeze(1).expand(bs, seq_len).reshape(-1)
+                    flat_sample_last = flat_sample_idx[flat_last]
+                    sent_sample_idx = torch.zeros((num_sent,), device=device, dtype=torch.long)
+                    sent_sample_idx.index_copy_(0, idx_last, flat_sample_last)
+
+                    return sent_emb, unique_sid, sent_sample_idx
+
+                if sentence_ids is not None and response_mask is not None and pooling in ("mean", "last"):
+                    with torch.no_grad():
+                        pooled = _pool_sentence_embeddings(hidden_states, sentence_ids, response_mask)
+                    if pooled is not None:
+                        sent_emb, unique_sid, sent_sample_idx = pooled
+                        tensors["sentence_embeddings"] = sent_emb
+                        tensors["sentence_unique_ids"] = unique_sid
+                        tensors["sentence_sample_idx"] = sent_sample_idx
+                    else:
+                        tensors["token_hidden_states"] = hidden_states
+                else:
+                    tensors["token_hidden_states"] = hidden_states
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 
@@ -1004,7 +1093,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            output, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
 
         output = output.to("cpu")

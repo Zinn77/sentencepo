@@ -165,7 +165,7 @@ class MegatronPPOActor(BasePPOActor):
         self.config = config
 
     @GPUMemoryLogger(role="megatron actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False, return_hidden_states: bool = False):
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -277,7 +277,7 @@ class MegatronPPOActor(BasePPOActor):
         # add empty cache after each compute
         get_torch_device().empty_cache()
 
-        return log_probs, entropys
+        return log_probs, entropys, None
 
     def make_minibatch_iterator(self, data: DataProto) -> Iterable[DataProto]:
         """Make minibatch iterator for updating the actor

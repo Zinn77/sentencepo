@@ -36,15 +36,15 @@ class BasePPOActor(ABC):
         self.config = config
 
     @abstractmethod
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
-        """Compute logits given a batch of data.
+    def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False, return_hidden_states: bool = False):
+        """Compute log probabilities (and optional entropy/hidden states) given a batch of data.
 
         Args:
             data (DataProto): a batch of data represented by DataProto. It must contain key ```input_ids```,
                 ```attention_mask``` and ```position_ids```.
 
         Returns:
-            DataProto: a DataProto containing the key ```log_probs```
+            Tuple: (log_probs, entropys, hidden_states)
 
 
         """

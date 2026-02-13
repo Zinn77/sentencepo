@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
@@ -208,6 +209,337 @@ def get_kl_controller(kl_ctrl):
         return AdaptiveKLController(init_kl_coef=kl_ctrl.kl_coef, target_kl=kl_ctrl.target_kl, horizon=kl_ctrl.horizon)
     else:
         raise NotImplementedError
+
+
+def apply_sentence_entropy_advantage(
+    advantages: torch.Tensor,
+    entropys: torch.Tensor,
+    sentence_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    alpha_pos: float = 0.1,
+    alpha_neg: float = 0.0,
+    norm: str = "zscore",
+    clip: float = 2.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Apply sentence-level entropy scaling to token advantages.
+
+    For each sentence, compute mean entropy and use it to scale the advantages
+    for tokens belonging to that sentence. Positive and negative advantages can
+    use different scaling strengths via ``alpha_pos`` and ``alpha_neg``.
+    """
+
+    if entropys is None or sentence_ids is None:
+        return advantages
+    if advantages.shape != entropys.shape or advantages.shape != sentence_ids.shape:
+        return advantages
+
+    with torch.no_grad():
+        if advantages.numel() == 0:
+            return advantages
+
+        bs, seq_len = sentence_ids.shape
+        device = sentence_ids.device
+
+        sid_max = sentence_ids.max().item() if sentence_ids.numel() > 0 else -1
+        sid_min = sentence_ids.min().item() if sentence_ids.numel() > 0 else -1
+        needs_offset = sid_max < seq_len and sid_min >= -1
+        if needs_offset:
+            offset = torch.arange(bs, device=device).unsqueeze(1) * (seq_len + 1)
+            sid_with_offset = sentence_ids + offset
+        else:
+            sid_with_offset = sentence_ids
+
+        valid_mask = (response_mask > 0) & (sentence_ids >= 0)
+        if not torch.any(valid_mask):
+            return advantages
+
+        flat_valid = valid_mask.view(-1)
+        flat_sid = sid_with_offset.view(-1)[flat_valid]
+        flat_ent = entropys.view(-1)[flat_valid]
+
+        unique_sid, inv = torch.unique(flat_sid, return_inverse=True)
+        ones = torch.ones_like(inv, dtype=flat_ent.dtype)
+        sent_lens = torch.zeros_like(unique_sid, dtype=flat_ent.dtype)
+        sent_lens.index_add_(0, inv, ones)
+        ent_sum = torch.zeros_like(unique_sid, dtype=flat_ent.dtype)
+        ent_sum.index_add_(0, inv, flat_ent)
+        sent_entropy = ent_sum / (sent_lens + eps)
+
+        norm_mode = (norm or "").lower()
+        if norm_mode in {"zscore", "std", "standard"}:
+            mu = sent_entropy.mean()
+            sigma = sent_entropy.std(unbiased=False).clamp_min(eps)
+            sent_entropy = (sent_entropy - mu) / sigma
+        elif norm_mode in {"minmax", "min-max"}:
+            minv = sent_entropy.min()
+            maxv = sent_entropy.max()
+            sent_entropy = (sent_entropy - minv) / (maxv - minv + eps)
+            sent_entropy = sent_entropy * 2.0 - 1.0
+
+        if clip is not None and clip > 0:
+            sent_entropy = sent_entropy.clamp(min=-clip, max=clip)
+
+        sent_entropy_token = sent_entropy[inv]
+        entropy_token = torch.zeros_like(advantages, dtype=advantages.dtype).view(-1)
+        entropy_token[flat_valid] = sent_entropy_token.to(advantages.dtype)
+        entropy_token = entropy_token.view_as(advantages)
+
+        alpha_tensor = torch.where(
+            advantages >= 0,
+            advantages.new_tensor(alpha_pos),
+            advantages.new_tensor(alpha_neg),
+        )
+        scale = 1.0 + alpha_tensor * entropy_token
+        advantages = advantages * scale
+
+    return advantages
+
+
+def compute_sentence_semantic_advantage(
+    token_hidden_states: torch.Tensor | None,
+    sentence_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    token_level_rewards: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    sentence_embeddings: torch.Tensor | None = None,
+    sentence_unique_ids: torch.Tensor | None = None,
+    sentence_sample_idx: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute bucketed sentence-level semantic advantage with correct/incorrect contrast.
+
+    Returns:
+        sentence_advantages: (bs, seq_len)
+        metrics: scalar metrics for bucket diagnostics
+    """
+
+    metrics: dict[str, float] = {}
+    if config is None:
+        return torch.zeros_like(response_mask, dtype=response_mask.dtype, device=response_mask.device), metrics
+    sentence_adv_cfg = getattr(config, "sentence_adv", None)
+    if sentence_adv_cfg is None or not getattr(sentence_adv_cfg, "enable", False):
+        return torch.zeros_like(response_mask, dtype=response_mask.dtype, device=response_mask.device), metrics
+
+    eps = float(getattr(sentence_adv_cfg, "eps", 1e-8))
+    bucket_count = max(1, int(getattr(sentence_adv_cfg, "bucket_count", 3)))
+    tau = float(getattr(sentence_adv_cfg, "temperature", 0.1))
+    normalize_adv = bool(getattr(sentence_adv_cfg, "normalize", True))
+    metrics_enable = bool(getattr(sentence_adv_cfg, "metrics_enable", True))
+
+    device = response_mask.device
+    sentence_ids = sentence_ids.to(device)
+    response_mask = response_mask.to(device)
+
+    bs, seq_len = sentence_ids.shape
+    valid = (response_mask > 0) & (sentence_ids >= 0)
+    if not torch.any(valid):
+        return torch.zeros((bs, seq_len), device=device, dtype=response_mask.dtype), metrics
+
+    flat_valid = valid.view(-1)
+    flat_sid = sentence_ids.view(-1)[flat_valid]
+    flat_idx = torch.nonzero(flat_valid, as_tuple=False).squeeze(-1)
+    flat_pos = (flat_idx % seq_len).to(torch.long)
+    flat_batch = (flat_idx // seq_len).to(torch.long)
+
+    if sentence_embeddings is not None and sentence_unique_ids is not None and sentence_sample_idx is not None:
+        sent_emb = sentence_embeddings.float().to(device)
+        unique_sid = sentence_unique_ids.to(device)
+        if unique_sid.numel() == 0:
+            return torch.zeros((bs, seq_len), device=device, dtype=sent_emb.dtype), metrics
+        inv = torch.searchsorted(unique_sid, flat_sid)
+        sent_sample_idx = sentence_sample_idx.to(device)
+    else:
+        if token_hidden_states is None:
+            return torch.zeros((bs, seq_len), device=device, dtype=response_mask.dtype), metrics
+
+        token_hidden_states = token_hidden_states.float().to(device)
+        bs, seq_len, hidden = token_hidden_states.shape
+        flat_emb = token_hidden_states.view(-1, hidden)[flat_valid]
+
+        unique_sid, inv = torch.unique(flat_sid, return_inverse=True)
+        num_sent = unique_sid.numel()
+        if num_sent == 0:
+            return torch.zeros((bs, seq_len), device=device, dtype=token_hidden_states.dtype), metrics
+
+        next_sid = torch.roll(sentence_ids, shifts=-1, dims=1)
+        next_valid = torch.roll(valid, shifts=-1, dims=1)
+        last_pos_mask = torch.zeros_like(valid)
+        last_pos_mask[:, -1] = True
+        boundary = last_pos_mask | (sentence_ids != next_sid) | (~next_valid)
+        last_mask = valid & boundary
+
+        flat_last = last_mask.view(-1)
+        flat_sid_last = sentence_ids.view(-1)[flat_last]
+        flat_emb_last = token_hidden_states.view(-1, hidden)[flat_last]
+
+        if flat_sid_last.numel() == 0:
+            return torch.zeros((bs, seq_len), device=device, dtype=token_hidden_states.dtype), metrics
+
+        idx_last = torch.searchsorted(unique_sid, flat_sid_last)
+
+        pooling = getattr(sentence_adv_cfg, "pooling", "last")
+        if pooling == "mean":
+            sum_emb = torch.zeros((num_sent, hidden), device=device, dtype=token_hidden_states.dtype)
+            cnt = torch.zeros((num_sent, 1), device=device, dtype=token_hidden_states.dtype)
+            sum_emb.index_add_(0, inv, flat_emb)
+            cnt.index_add_(0, inv, torch.ones((flat_emb.size(0), 1), device=device, dtype=token_hidden_states.dtype))
+            sent_emb = sum_emb / (cnt + eps)
+        elif pooling == "last":
+            sent_emb = torch.zeros((num_sent, hidden), device=device, dtype=token_hidden_states.dtype)
+            sent_emb.index_copy_(0, idx_last, flat_emb_last)
+        else:
+            raise ValueError(f"Unknown sentence_adv.pooling: {pooling}")
+
+        flat_sample_idx = torch.arange(bs, device=device).unsqueeze(1).expand(bs, seq_len).reshape(-1)
+        flat_sample_last = flat_sample_idx[flat_last]
+        sent_sample_idx = torch.zeros((num_sent,), device=device, dtype=torch.long)
+        sent_sample_idx.index_copy_(0, idx_last, flat_sample_last)
+
+    num_sent = sent_emb.shape[0]
+    if num_sent == 0:
+        return torch.zeros((bs, seq_len), device=device, dtype=sent_emb.dtype), metrics
+
+    sent_first_pos = torch.full((num_sent,), seq_len, device=device, dtype=torch.long)
+    try:
+        sent_first_pos = sent_first_pos.scatter_reduce(0, inv, flat_pos, reduce="amin", include_self=True)
+    except Exception:
+        for i in range(num_sent):
+            m = inv == i
+            if torch.any(m):
+                sent_first_pos[i] = flat_pos[m].min()
+
+    sent_batch_sum = torch.zeros((num_sent,), device=device, dtype=torch.float)
+    sent_batch_sum.index_add_(0, inv, flat_batch.to(torch.float))
+    sent_counts = torch.zeros((num_sent,), device=device, dtype=torch.float)
+    sent_counts.index_add_(0, inv, torch.ones_like(flat_pos, dtype=torch.float))
+    sent_batch = (sent_batch_sum / (sent_counts + eps)).round().long()
+
+    sent_bucket = torch.full((num_sent,), -1, device=device, dtype=torch.long)
+    sent_count_per_sample = torch.zeros((bs,), device=device, dtype=torch.long)
+    for b in range(bs):
+        mask = sent_batch == b
+        if not torch.any(mask):
+            continue
+        pos = sent_first_pos[mask]
+        order = torch.argsort(pos)
+        ranks = torch.zeros_like(order)
+        ranks[order] = torch.arange(order.numel(), device=device)
+        n_sent = int(order.numel())
+        sent_count_per_sample[b] = n_sent
+        bucket = (ranks * bucket_count) // max(n_sent, 1)
+        sent_bucket[mask] = bucket
+
+    scores = token_level_rewards.to(device).sum(dim=-1)
+    correct = scores > float(getattr(sentence_adv_cfg, "correctness_threshold", 0.0))
+
+    sent_emb = F.normalize(sent_emb, dim=-1)
+    group_ids = as_torch_index(index, device=device)
+    sent_group = group_ids[sent_sample_idx]
+    num_groups = int(group_ids.max().item()) + 1 if group_ids.numel() > 0 else 0
+
+    sent_adv = torch.zeros((num_sent,), device=device, dtype=sent_emb.dtype)
+    bucket_sent_count = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    pos_center_pos_sum = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    pos_center_pos_cnt = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    pos_center_neg_sum = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    pos_center_neg_cnt = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    neg_center_neg_sum = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    neg_center_neg_cnt = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    neg_center_pos_sum = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    neg_center_pos_cnt = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    center_cos_sum = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    center_cos_cnt = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    sep_sum = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    sep_cnt = torch.zeros((bucket_count,), device=device, dtype=torch.float)
+    with torch.no_grad():
+        for g in range(num_groups):
+            group_mask = sent_group == g
+            if not torch.any(group_mask):
+                continue
+            for b in range(bucket_count):
+                mask = group_mask & (sent_bucket == b)
+                if not torch.any(mask):
+                    continue
+                bucket_sent_count[b] += mask.float().sum()
+                sample_idx_g = sent_sample_idx[mask]
+                pos_mask = correct[sample_idx_g]
+                neg_mask = ~pos_mask
+                if not torch.any(pos_mask) or not torch.any(neg_mask):
+                    continue
+                E = sent_emb[mask]
+                pos_center = F.normalize(E[pos_mask].mean(dim=0, keepdim=False), dim=-1)
+                neg_center = F.normalize(E[neg_mask].mean(dim=0, keepdim=False), dim=-1)
+                sim_pos_raw = (E * pos_center).sum(dim=-1)
+                sim_neg_raw = (E * neg_center).sum(dim=-1)
+                sim_pos = sim_pos_raw / tau
+                sim_neg = sim_neg_raw / tau
+                A = sim_pos - sim_neg
+                if normalize_adv and A.numel() > 1:
+                    A = (A - A.mean()) / (A.std(unbiased=False) + eps)
+                sent_adv[mask] = A
+
+                if metrics_enable:
+                    pos_center_pos_sum[b] += sim_pos_raw[pos_mask].sum()
+                    pos_center_pos_cnt[b] += pos_mask.float().sum()
+                    pos_center_neg_sum[b] += sim_pos_raw[neg_mask].sum()
+                    pos_center_neg_cnt[b] += neg_mask.float().sum()
+                    neg_center_neg_sum[b] += sim_neg_raw[neg_mask].sum()
+                    neg_center_neg_cnt[b] += neg_mask.float().sum()
+                    neg_center_pos_sum[b] += sim_neg_raw[pos_mask].sum()
+                    neg_center_pos_cnt[b] += pos_mask.float().sum()
+                    center_cos_sum[b] += (pos_center * neg_center).sum()
+                    center_cos_cnt[b] += 1.0
+
+                    pos_mean = sim_pos_raw[pos_mask].mean()
+                    neg_mean = sim_neg_raw[neg_mask].mean()
+                    pos_to_neg_mean = sim_neg_raw[pos_mask].mean()
+                    neg_to_pos_mean = sim_pos_raw[neg_mask].mean()
+                    sep = 0.5 * (pos_mean + neg_mean) - 0.5 * (pos_to_neg_mean + neg_to_pos_mean)
+                    sep_sum[b] += sep
+                    sep_cnt[b] += 1.0
+
+    flat_adv = torch.zeros_like(sentence_ids.view(-1), dtype=sent_emb.dtype)
+    flat_adv[flat_valid] = sent_adv[inv]
+    sent_adv_tokens = flat_adv.view(bs, seq_len) * response_mask
+
+    if metrics_enable:
+        metrics["sentence_adv/bucket_count"] = float(bucket_count)
+        for b in range(bucket_count):
+            mask = sent_bucket == b
+            count = int(mask.sum().item())
+            metrics[f"sentence_adv/bucket_{b}/sent_count"] = float(count)
+            if count > 0:
+                vals = sent_adv[mask]
+                metrics[f"sentence_adv/bucket_{b}/adv_mean"] = float(vals.mean().item())
+                metrics[f"sentence_adv/bucket_{b}/adv_std"] = float(vals.std(unbiased=False).item())
+            else:
+                metrics[f"sentence_adv/bucket_{b}/adv_mean"] = 0.0
+                metrics[f"sentence_adv/bucket_{b}/adv_std"] = 0.0
+
+            def _safe_div(num: torch.Tensor, den: torch.Tensor) -> float:
+                if den.item() <= 0:
+                    return 0.0
+                return float((num / den).item())
+
+            metrics[f"sentence_adv/bucket_{b}/sim_pos_center_pos_mean"] = _safe_div(
+                pos_center_pos_sum[b], pos_center_pos_cnt[b]
+            )
+            metrics[f"sentence_adv/bucket_{b}/sim_pos_center_neg_mean"] = _safe_div(
+                pos_center_neg_sum[b], pos_center_neg_cnt[b]
+            )
+            metrics[f"sentence_adv/bucket_{b}/sim_neg_center_neg_mean"] = _safe_div(
+                neg_center_neg_sum[b], neg_center_neg_cnt[b]
+            )
+            metrics[f"sentence_adv/bucket_{b}/sim_neg_center_pos_mean"] = _safe_div(
+                neg_center_pos_sum[b], neg_center_pos_cnt[b]
+            )
+            metrics[f"sentence_adv/bucket_{b}/center_cos"] = _safe_div(center_cos_sum[b], center_cos_cnt[b])
+            metrics[f"sentence_adv/bucket_{b}/sep"] = _safe_div(sep_sum[b], sep_cnt[b])
+        metrics["sentence_adv/adv_mean"] = float(sent_adv.mean().item()) if num_sent > 0 else 0.0
+        metrics["sentence_adv/adv_std"] = float(sent_adv.std(unbiased=False).item()) if num_sent > 1 else 0.0
+
+    return sent_adv_tokens, metrics
 
 
 @register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")

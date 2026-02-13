@@ -23,7 +23,7 @@ test_files="['$math500_test_path', '$aime2024_test_path', '$aime2025_test_path',
 
 # 训练设置
 DS=${DS:-math}
-EPOCHS=${EPOCHS:-5}
+EPOCHS=${EPOCHS:-3}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B-Base}
 MODEL_NAME=${MODEL_NAME:-qwen3_4b}
 lr=1e-6
@@ -33,11 +33,13 @@ max_response_length=4096
 max_num_batched_tokens=8192    # 默认 8192
 micro_batch_size=4
 
-mkdir -p $HOME/autodl-tmp/models/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}
+TOT_DIR=$HOME/autodl-tmp/models_v1-1/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}
+mkdir -p $TOT_DIR
+mkdir -p $TOT_DIR/verl_checkpoints_grpo
 
-cd $HOME/sentencepo
+cd $HOME/sentencepo_v1-1
 
-PYTHONPATH=$HOME/sentencepo \
+PYTHONPATH=$HOME/sentencepo_v1-1 \
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
@@ -53,7 +55,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$micro_batch_size \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.entropy_coeff=0 \
@@ -66,7 +68,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$micro_batch_size \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$max_num_batched_tokens \
@@ -83,8 +85,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="grpo_ep${EPOCHS}" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=150 \
+    trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=$EPOCHS \
-    trainer.default_local_dir=$HOME/autodl-tmp/models/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}/verl_checkpoints_grpo \
-    "$@" 2>&1 | tee $HOME/autodl-tmp/models/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}/verl_grpo.log
+    trainer.default_local_dir=$TOT_DIR/verl_checkpoints_grpo \
+    "$@" 2>&1 | tee $TOT_DIR/verl_grpo.log
