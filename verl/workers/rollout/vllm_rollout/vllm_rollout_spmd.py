@@ -330,6 +330,10 @@ class vLLMRollout(BaseRollout):
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
+        response_length = prompts.meta_info.get("response_length") if prompts.meta_info is not None else None
+        if response_length is not None:
+            kwargs["max_tokens"] = int(response_length)
+
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())

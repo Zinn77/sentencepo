@@ -58,6 +58,6 @@ fi
 
 echo "7. Extra fixes"
 pip install ray==2.43.0
-pip uninstall uvloop -y
+# pip uninstall uvloop -y+]
 
 echo "Successfully installed all packages"

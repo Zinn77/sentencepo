@@ -25,7 +25,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -50,6 +50,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.sentence_judge_adv import SentenceJudgeAdvantage
 from verl.trainer.ppo.mismatch_helper import compute_rollout_importance_weights
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -60,6 +61,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import get_response_mask, masked_mean
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
@@ -270,6 +272,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    tokenizer=None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -340,6 +343,154 @@ def compute_advantage(
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+    sentence_adv_cfg = getattr(config, "sentence_adv", None) if config is not None else None
+    if sentence_adv_cfg is not None and getattr(sentence_adv_cfg, "enable", False):
+        sentence_ids = data.batch.get("sentence_ids")
+        response_mask = data.batch.get("response_mask")
+        index = data.non_tensor_batch.get("uid") if data.non_tensor_batch is not None else None
+        if sentence_ids is not None and response_mask is not None and index is not None:
+            token_hidden_states = data.batch["token_hidden_states"] if "token_hidden_states" in data.batch else None
+            sentence_embeddings = (
+                data.batch["sentence_embeddings"] if "sentence_embeddings" in data.batch else None
+            )
+            sentence_unique_ids = (
+                data.batch["sentence_unique_ids"] if "sentence_unique_ids" in data.batch else None
+            )
+            sentence_sample_idx = (
+                data.batch["sentence_sample_idx"] if "sentence_sample_idx" in data.batch else None
+            )
+            sentence_adv, sentence_adv_metrics = core_algos.compute_sentence_semantic_advantage(
+                token_hidden_states=token_hidden_states,
+                sentence_ids=sentence_ids,
+                response_mask=response_mask,
+                index=index,
+                token_level_rewards=data.batch["token_level_rewards"],
+                config=config,
+                sentence_embeddings=sentence_embeddings,
+                sentence_unique_ids=sentence_unique_ids,
+                sentence_sample_idx=sentence_sample_idx,
+            )
+            alpha = float(getattr(sentence_adv_cfg, "alpha", 0.1))
+            data.batch["advantages"] = data.batch["advantages"] + alpha * sentence_adv
+            data.batch["returns"] = data.batch["returns"] + alpha * sentence_adv
+            if sentence_adv_metrics:
+                if data.meta_info is None:
+                    data.meta_info = {}
+                data.meta_info["sentence_adv_metrics"] = sentence_adv_metrics
+        data.batch.pop("token_hidden_states", None)
+        data.batch.pop("sentence_embeddings", None)
+        data.batch.pop("sentence_unique_ids", None)
+        data.batch.pop("sentence_sample_idx", None)
+
+    sentence_judge_cfg = getattr(config, "sentence_judge_adv", None) if config is not None else None
+    if sentence_judge_cfg is not None and getattr(sentence_judge_cfg, "enable", False):
+        backend = str(getattr(sentence_judge_cfg, "judge_backend", "dummy") or "dummy").lower()
+        sentence_ids = data.batch.get("sentence_ids")
+        response_mask = data.batch.get("response_mask")
+        responses = data.batch.get("responses")
+        prompts = data.batch.get("prompts")
+        if (
+            tokenizer is not None
+            and sentence_ids is not None
+            and response_mask is not None
+            and responses is not None
+            and prompts is not None
+        ):
+            non_tensor_batch = data.non_tensor_batch or {}
+            skip_judge = backend in {"self", "actor"} and "judge_outputs" not in non_tensor_batch
+            if not skip_judge:
+                device = response_mask.device
+                cache = getattr(compute_advantage, "_sentence_judge_cache", {})
+                cache_key = (
+                    id(tokenizer),
+                    str(getattr(sentence_judge_cfg, "judge_backend", "dummy")),
+                    str(getattr(sentence_judge_cfg, "judge_fn", "")),
+                )
+                if cache_key not in cache:
+                    cache[cache_key] = SentenceJudgeAdvantage(sentence_judge_cfg, tokenizer, device=device)
+                    setattr(compute_advantage, "_sentence_judge_cache", cache)
+                judge = cache[cache_key]
+
+            if not skip_judge:
+                bs = responses.shape[0]
+                prompt_len = prompts.shape[-1]
+                prompt_texts: list[str] = []
+                response_texts: list[str] = []
+                attention_mask = data.batch.get("attention_mask")
+                max_chars = int(getattr(sentence_judge_cfg, "max_chars", 0) or 0)
+                for b in range(bs):
+                    if attention_mask is not None:
+                        pmask = attention_mask[b, :prompt_len].bool()
+                        prompt_ids = prompts[b][pmask]
+                    else:
+                        prompt_ids = prompts[b]
+                    prompt_text = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=True)
+
+                    rmask = response_mask[b].bool()
+                    response_ids = responses[b][rmask]
+                    response_text = tokenizer.decode(response_ids.tolist(), skip_special_tokens=True)
+                    if max_chars > 0:
+                        prompt_text = prompt_text[:max_chars]
+                        response_text = response_text[:max_chars]
+                    prompt_texts.append(prompt_text)
+                    response_texts.append(response_text)
+
+                seq_rewards = data.batch["token_level_rewards"].sum(-1)
+                extra_batch: list[dict[str, Any]] = []
+                for b in range(bs):
+                    extra: dict[str, Any] = {}
+                    for key in ["reference_answer", "ground_truth", "verifier_error", "reward_model"]:
+                        if key in non_tensor_batch:
+                            try:
+                                extra[key] = non_tensor_batch[key][b]
+                            except Exception:
+                                extra[key] = non_tensor_batch[key]
+                    if "judge_outputs" in non_tensor_batch:
+                        try:
+                            extra["judge_output"] = non_tensor_batch["judge_outputs"][b]
+                        except Exception:
+                            extra["judge_output"] = non_tensor_batch["judge_outputs"]
+                    extra_batch.append(extra)
+
+                judge_adv, judge_metrics = judge.compute_batch(
+                    prompts=prompt_texts,
+                    responses=response_texts,
+                    response_tokens=responses,
+                    sentence_ids=sentence_ids,
+                    response_mask=response_mask,
+                    sequence_rewards=seq_rewards,
+                    extra_batch=extra_batch,
+                )
+                alpha = float(getattr(sentence_judge_cfg, "alpha", 0.05))
+                data.batch["advantages"] = data.batch["advantages"] + alpha * judge_adv
+                data.batch["returns"] = data.batch["returns"] + alpha * judge_adv
+                if judge_metrics:
+                    if data.meta_info is None:
+                        data.meta_info = {}
+                    data.meta_info["sentence_judge_adv_metrics"] = judge_metrics
+    policy_loss_cfg = None
+    if config is not None and hasattr(config, "actor_rollout_ref") and hasattr(config.actor_rollout_ref, "actor"):
+        policy_loss_cfg = getattr(config.actor_rollout_ref.actor, "policy_loss", None)
+
+    if policy_loss_cfg is not None and getattr(policy_loss_cfg, "sentencepo_adv_entropy_enable", False):
+        entropys = data.batch.get("entropys")
+        sentence_ids = data.batch.get("sentence_ids")
+        response_mask = data.batch.get("response_mask")
+        if entropys is not None and sentence_ids is not None and response_mask is not None:
+            advantages = core_algos.apply_sentence_entropy_advantage(
+                advantages=data.batch["advantages"],
+                entropys=entropys,
+                sentence_ids=sentence_ids,
+                response_mask=response_mask,
+                alpha_pos=float(getattr(policy_loss_cfg, "sentencepo_adv_entropy_alpha_pos", 0.1)),
+                alpha_neg=float(getattr(policy_loss_cfg, "sentencepo_adv_entropy_alpha_neg", 0.0)),
+                norm=str(getattr(policy_loss_cfg, "sentencepo_adv_entropy_norm", "zscore")),
+                clip=float(getattr(policy_loss_cfg, "sentencepo_adv_entropy_clip", 2.0)),
+                eps=float(getattr(policy_loss_cfg, "sentencepo_adv_entropy_eps", 1e-6)),
+            )
+            data.batch["advantages"] = advantages
+        data.batch.pop("entropys", None)
     return data
 
 
@@ -526,6 +677,515 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _generate_self_judge_outputs(self, batch: DataProto, sentence_judge_cfg) -> dict[str, list[str]] | None:
+        sentence_ids = batch.batch.get("sentence_ids")
+        response_mask = batch.batch.get("response_mask")
+        responses = batch.batch.get("responses")
+        prompts = batch.batch.get("prompts")
+        attention_mask = batch.batch.get("attention_mask")
+        if (
+            self.tokenizer is None
+            or sentence_ids is None
+            or response_mask is None
+            or responses is None
+            or prompts is None
+        ):
+            return None
+
+        judge = SentenceJudgeAdvantage(sentence_judge_cfg, self.tokenizer, device=response_mask.device)
+        bs = responses.shape[0]
+        prompt_len = prompts.shape[-1]
+        prompt_texts: list[str] = []
+        sentence_texts_list: list[list[str]] = []
+        rendered_prompts: list[str] = []
+        seq_rewards = batch.batch["token_level_rewards"].sum(-1)
+        correctness_threshold = float(getattr(sentence_judge_cfg, "correctness_threshold", 0.0))
+        max_chars = int(getattr(sentence_judge_cfg, "max_chars", 0) or 0)
+        max_sentences = int(getattr(sentence_judge_cfg, "max_sentences", 0) or 0)
+
+        for b in range(bs):
+            if attention_mask is not None:
+                pmask = attention_mask[b, :prompt_len].bool()
+                prompt_ids = prompts[b][pmask]
+            else:
+                prompt_ids = prompts[b]
+            prompt_text = self.tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=True)
+            prompt_texts.append(prompt_text)
+
+            sentence_texts, _ = judge._extract_sentence_texts(
+                responses[b], sentence_ids[b], response_mask[b]
+            )
+            if max_chars > 0:
+                sentence_texts = [s[:max_chars] for s in sentence_texts]
+            if max_sentences > 0 and len(sentence_texts) > max_sentences:
+                sentence_texts = sentence_texts[:max_sentences]
+            sentence_texts_list.append(sentence_texts)
+            overall_correct = float(seq_rewards[b].item()) > correctness_threshold
+            rendered_prompts.append(judge._build_prompt(prompt_text, sentence_texts, overall_correct))
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        judge_max_tokens = int(getattr(sentence_judge_cfg, "judge_max_tokens", 256))
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        rollout_max_model_len = getattr(rollout_cfg, "max_model_len", None)
+        if rollout_max_model_len is None:
+            prompt_cap = int(getattr(rollout_cfg, "prompt_length", 0) or 0)
+            response_cap = int(getattr(rollout_cfg, "response_length", 0) or 0)
+            if prompt_cap > 0 and response_cap > 0:
+                rollout_max_model_len = prompt_cap + response_cap
+
+        max_judge_prompt_tokens = None
+        if rollout_max_model_len is not None:
+            rollout_max_model_len = int(rollout_max_model_len)
+            if rollout_max_model_len > judge_max_tokens:
+                max_judge_prompt_tokens = rollout_max_model_len - judge_max_tokens
+
+        truncate_judge_prompt = bool(getattr(sentence_judge_cfg, "truncate_prompt", False))
+
+        old_padding_side = self.tokenizer.padding_side
+        old_truncation_side = getattr(self.tokenizer, "truncation_side", "right")
+        self.tokenizer.padding_side = "right"
+        if truncate_judge_prompt:
+            self.tokenizer.truncation_side = "right"
+        tokenizer_kwargs = {
+            "padding": True,
+            "truncation": truncate_judge_prompt,
+            "return_tensors": "pt",
+        }
+        if truncate_judge_prompt and max_judge_prompt_tokens is not None:
+            tokenizer_kwargs["max_length"] = max_judge_prompt_tokens
+        inputs = self.tokenizer(rendered_prompts, **tokenizer_kwargs)
+
+        if (not truncate_judge_prompt) and (max_judge_prompt_tokens is not None):
+            prompt_lengths = inputs["attention_mask"].sum(-1)
+            too_long = prompt_lengths > max_judge_prompt_tokens
+            if torch.any(too_long):
+                try:
+                    # 超长时落盘检查
+                    overflow_dir = None
+                    trainer_cfg = getattr(self.config, "trainer", None)
+                    if trainer_cfg is not None:
+                        overflow_root = trainer_cfg.get("rollout_data_dir", None)
+                        if not overflow_root:
+                            overflow_root = trainer_cfg.get("default_local_dir", None)
+                        if overflow_root:
+                            overflow_dir = os.path.join(str(overflow_root), "self_judge_overflow")
+                    if overflow_dir:
+                        os.makedirs(overflow_dir, exist_ok=True)
+                        over_indices = torch.nonzero(too_long, as_tuple=False).squeeze(-1).detach().cpu().tolist()
+                        dump_path = os.path.join(
+                            overflow_dir,
+                            f"step_{int(getattr(self, 'global_steps', -1))}_{uuid.uuid4().hex}.jsonl",
+                        )
+                        with open(dump_path, "w", encoding="utf-8") as f:
+                            for idx in over_indices:
+                                record = {
+                                    "index": int(idx),
+                                    "global_step": int(getattr(self, "global_steps", -1)),
+                                    "prompt_tokens": int(prompt_lengths[idx].item()),
+                                    "allowed_prompt_tokens": int(max_judge_prompt_tokens),
+                                    "rollout_max_model_len": int(rollout_max_model_len),
+                                    "judge_max_tokens": int(judge_max_tokens),
+                                    "sentence_count": int(len(sentence_texts_list[idx])),
+                                    "prompt_text": prompt_texts[idx],
+                                    "sentence_texts": sentence_texts_list[idx],
+                                    "rendered_prompt": rendered_prompts[idx],
+                                }
+                                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        print(f"Dumped self-judge overflow prompts to {dump_path}")
+                except Exception as dump_exc:
+                    print(f"Failed to dump self-judge overflow prompts: {dump_exc}")
+                max_seen = int(prompt_lengths.max().item())
+                raise ValueError(
+                    "Self-judge prompt exceeds rollout budget without truncation. "
+                    f"max_prompt_tokens={max_seen}, allowed_prompt_tokens={max_judge_prompt_tokens}, "
+                    f"rollout.max_model_len={rollout_max_model_len}, judge_max_tokens={judge_max_tokens}. "
+                    "Increase actor_rollout_ref.rollout.max_model_len (and max_num_batched_tokens if needed), "
+                    "or set algorithm.sentence_judge_adv.truncate_prompt=true."
+                )
+
+        self.tokenizer.padding_side = old_padding_side
+        self.tokenizer.truncation_side = old_truncation_side
+
+        input_ids = inputs["input_ids"]
+        judge_attention_mask = inputs["attention_mask"]
+        position_ids = compute_position_id_with_mask(judge_attention_mask)
+        judge_data = DataProto.from_dict(
+            tensors={
+                "input_ids": input_ids,
+                "attention_mask": judge_attention_mask,
+                "position_ids": position_ids,
+            }
+        )
+        judge_data.meta_info["response_length"] = judge_max_tokens
+        judge_data.meta_info["do_sample"] = False
+
+        size_divisor = (
+            self.actor_rollout_wg.world_size
+            if not self.async_rollout_mode
+            else self.config.actor_rollout_ref.rollout.agent.num_workers
+        )
+        judge_data_padded, pad_size = pad_dataproto_to_divisor(judge_data, size_divisor)
+        if not self.async_rollout_mode:
+            judge_output_padded = self.actor_rollout_wg.generate_sequences(judge_data_padded)
+        else:
+            judge_output_padded = self.async_rollout_manager.generate_sequences(judge_data_padded)
+        judge_output = unpad_dataproto(judge_output_padded, pad_size=pad_size)
+
+        output_responses = judge_output.batch.get("responses")
+        output_mask = judge_output.batch["response_mask"] if "response_mask" in judge_output.batch.keys() else None
+        if output_responses is None:
+            return None
+
+        # Rollout output may not include `response_mask`; reconstruct it from the canonical source.
+        if output_mask is None:
+            # Canonical for vLLM: response_attention_mask is concatenated to the tail of attention_mask.
+            if "attention_mask" in judge_output.batch.keys():
+                full_attention_mask = judge_output.batch["attention_mask"]
+                resp_width = int(output_responses.shape[-1])
+                if full_attention_mask.shape[-1] >= resp_width:
+                    output_mask = full_attention_mask[:, -resp_width:]
+
+            # Fallback: derive mask from responses and eos.
+            if output_mask is None:
+                eos_token_id = self.tokenizer.eos_token_id
+                if eos_token_id is not None:
+                    output_mask = get_response_mask(
+                        response_id=output_responses,
+                        eos_token=eos_token_id,
+                        dtype=torch.int64,
+                    )
+                else:
+                    pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+                    output_mask = (output_responses != pad_id).to(torch.int64)
+
+        outputs: list[str] = []
+        pad_id = self.tokenizer.pad_token_id or 0
+        for b in range(output_responses.shape[0]):
+            if output_mask is not None:
+                rmask = output_mask[b].bool()
+                response_ids = output_responses[b][rmask]
+            else:
+                response_ids = output_responses[b][output_responses[b] != pad_id]
+            outputs.append(self.tokenizer.decode(response_ids.tolist(), skip_special_tokens=True))
+
+        return {
+            "judge_outputs": outputs,
+            "judge_prompts": rendered_prompts,
+        }
+
+    def _build_sentence_analysis_records(
+        self,
+        batch: DataProto,
+        log_prob_new: torch.Tensor,
+        old_log_prob: torch.Tensor | None,
+        entropys: torch.Tensor | None,
+        ref_log_prob: torch.Tensor | None,
+        max_samples: int,
+        loss_mode: str,
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        sentence_ids = batch.batch.get("sentence_ids")
+        if sentence_ids is None:
+            return []
+
+        responses = batch.batch["responses"]
+        response_mask = batch.batch["response_mask"].to(bool)
+        bs = responses.shape[0]
+        n = min(bs, max_samples)
+
+        has_old = old_log_prob is not None
+        rewards = None
+        if "token_level_scores" in batch.batch:
+            rewards = (batch.batch["token_level_scores"] * response_mask).sum(-1)
+
+        policy_cfg = getattr(self.config.actor_rollout_ref.actor, "policy_loss", None)
+        eps_base = getattr(policy_cfg, "sentencepo_eps_base", 0.2)
+        lambda_ppl = getattr(policy_cfg, "sentencepo_lambda_ppl", 0.5)
+        lambda_len = getattr(policy_cfg, "sentencepo_lambda_len", 0.5)
+        cmin = getattr(policy_cfg, "sentencepo_cmin", 0.5)
+        cmax = getattr(policy_cfg, "sentencepo_cmax", 1.5)
+        stats_eps = getattr(policy_cfg, "sentencepo_stats_eps", 1e-6)
+
+        clip_ratio_low = self.config.actor_rollout_ref.actor.clip_ratio_low
+        if clip_ratio_low is None:
+            clip_ratio_low = self.config.actor_rollout_ref.actor.clip_ratio
+        clip_ratio_high = self.config.actor_rollout_ref.actor.clip_ratio_high
+        if clip_ratio_high is None:
+            clip_ratio_high = self.config.actor_rollout_ref.actor.clip_ratio
+
+        # Precompute sentence-level aggregates across batch
+        flat_mask = response_mask.view(-1)
+        flat_sid = sentence_ids.view(-1)
+        valid = (flat_mask > 0) & (flat_sid >= 0)
+        if not torch.any(valid):
+            return []
+
+        bs, seq_len = responses.shape
+        flat_logp_new = log_prob_new.view(-1)[valid]
+        flat_logp_old = old_log_prob.view(-1)[valid] if has_old else None
+        flat_sid_valid = flat_sid.view(-1)[valid]
+
+        unique_sid, inv = torch.unique(flat_sid_valid, return_inverse=True)
+        num_sent = unique_sid.numel()
+        ones = torch.ones_like(flat_logp_new, dtype=flat_logp_new.dtype)
+
+        cnt = torch.zeros(num_sent, device=flat_logp_new.device, dtype=flat_logp_new.dtype)
+        cnt.index_add_(0, inv, ones)
+
+        delta = None
+        delta_sum = None
+        delta_mean = None
+        old_mean = None
+        ppl_sent = None
+        if has_old and flat_logp_old is not None:
+            delta = flat_logp_new - flat_logp_old
+            delta_sum = torch.zeros(num_sent, device=flat_logp_new.device, dtype=flat_logp_new.dtype)
+            delta_sum.index_add_(0, inv, delta)
+            delta_mean = delta_sum / (cnt + 1e-8)
+
+            old_sum = torch.zeros(num_sent, device=flat_logp_new.device, dtype=flat_logp_new.dtype)
+            old_sum.index_add_(0, inv, flat_logp_old)
+            old_mean = old_sum / (cnt + 1e-8)
+            ppl_sent = torch.exp(-old_mean)
+
+        max_abs = None
+        kl_sent = None
+        if delta is not None:
+            try:
+                max_abs = torch.full((num_sent,), -1e9, device=delta.device, dtype=delta.dtype)
+                max_abs = max_abs.scatter_reduce(0, inv, delta.abs(), reduce="amax", include_self=True)
+            except Exception:
+                max_abs = torch.zeros(num_sent, device=delta.device, dtype=delta.dtype)
+                for idx in range(num_sent):
+                    m = inv == idx
+                    if torch.any(m):
+                        max_abs[idx] = delta[m].abs().max()
+
+            kl_sent = -delta_mean
+
+        ref_kl = None
+        if ref_log_prob is not None:
+            flat_ref = ref_log_prob.view(-1)[valid]
+            ref_delta = flat_logp_new - flat_ref
+            ref_sum = torch.zeros(num_sent, device=flat_logp_new.device, dtype=flat_logp_new.dtype)
+            ref_sum.index_add_(0, inv, ref_delta)
+            ref_mean = ref_sum / (cnt + 1e-8)
+            ref_kl = -ref_mean
+
+        # SentencePO clip bounds (require old log-prob)
+        lower = None
+        upper = None
+        sent_clipped = None
+        if has_old and old_mean is not None and delta_mean is not None:
+            log_ppl = (-old_mean).float()
+            log_len = torch.log(cnt.float().clamp_min(1.0))
+            mu_ppl = log_ppl.detach().mean()
+            sigma_ppl = log_ppl.detach().std(unbiased=False).clamp_min(stats_eps)
+            mu_len = log_len.detach().mean()
+            sigma_len = log_len.detach().std(unbiased=False).clamp_min(stats_eps)
+            z_ppl = torch.tanh((log_ppl - mu_ppl) / sigma_ppl)
+            z_len = torch.tanh((log_len - mu_len) / sigma_len)
+            scale = (1.0 + lambda_ppl * z_ppl - lambda_len * z_len).clamp(cmin, cmax)
+            c0 = torch.log1p(torch.as_tensor(eps_base, device=delta_mean.device, dtype=delta_mean.dtype))
+            c_sent = c0 * scale.to(delta_mean.dtype)
+            lower = torch.exp(-c_sent)
+            upper = torch.exp(c_sent)
+            sent_clipped = (torch.exp(delta_mean) < lower) | (torch.exp(delta_mean) > upper)
+
+        records: list[dict[str, Any]] = []
+        for i in range(n):
+            row_mask = response_mask[i]
+            row_sent = sentence_ids[i]
+            row_resp = responses[i]
+            row_logp_new = log_prob_new[i]
+            row_logp_old = old_log_prob[i] if has_old else None
+            row_entropy = entropys[i] if entropys is not None else None
+
+            valid = row_mask & (row_sent >= 0)
+            if not torch.any(valid):
+                continue
+
+            sent_ids = torch.unique(row_sent[valid])
+            sent_ids = sent_ids.sort().values
+
+            seq_len = int(row_mask.sum().item())
+            seq_ratio = None
+            response_clipped = None
+            if row_logp_old is not None:
+                seq_log_ratio = ((row_logp_new - row_logp_old) * row_mask).sum() / max(seq_len, 1)
+                seq_ratio = float(torch.exp(seq_log_ratio).item())
+                if loss_mode == "gspo":
+                    response_clipped = (seq_ratio < (1 - clip_ratio_low)) or (seq_ratio > (1 + clip_ratio_high))
+                elif loss_mode in {"vanilla", "grpo"}:
+                    token_ratio = torch.exp(row_logp_new - row_logp_old)
+                    token_ratio = token_ratio[row_mask]
+                    response_clipped = bool(
+                        torch.any(token_ratio < (1 - clip_ratio_low))
+                        or torch.any(token_ratio > (1 + clip_ratio_high))
+                    )
+
+            sent_records = []
+            sent_ids_list = sent_ids.tolist()
+            for sid in sent_ids_list:
+                m = (row_sent == sid) & row_mask
+                if not torch.any(m):
+                    continue
+                token_ids = row_resp[m].tolist()
+                sent_text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+
+                # Map sentence to precomputed arrays
+                sid_idx = (unique_sid == sid).nonzero(as_tuple=False).squeeze(-1)
+                if sid_idx.numel() == 0:
+                    continue
+                sid_idx = int(sid_idx.item())
+
+                sent_record = {
+                    "sentence_id": int(sid),
+                    "token_count": int(cnt[sid_idx].item()),
+                    "text": sent_text,
+                    "mean_log_ratio": float(delta_mean[sid_idx].item()) if delta_mean is not None else None,
+                    "sum_log_ratio": float(delta_sum[sid_idx].item()) if delta_sum is not None else None,
+                    "max_abs_log_ratio": float(max_abs[sid_idx].item()) if max_abs is not None else None,
+                    "ppl": float(ppl_sent[sid_idx].item()) if ppl_sent is not None else None,
+                    "entropy": float(row_entropy[m].mean().item()) if row_entropy is not None else None,
+                    "kl_old": float(kl_sent[sid_idx].item()) if kl_sent is not None else None,
+                }
+                if ref_kl is not None:
+                    sent_record["kl_ref"] = float(ref_kl[sid_idx].item())
+                if loss_mode == "sentencepo":
+                    if sent_clipped is not None:
+                        sent_record["clipped"] = bool(sent_clipped[sid_idx].item())
+                        sent_record["clip_lower"] = float(lower[sid_idx].item()) if lower is not None else None
+                        sent_record["clip_upper"] = float(upper[sid_idx].item()) if upper is not None else None
+                    else:
+                        sent_record["clipped"] = None
+                        sent_record["clip_lower"] = None
+                        sent_record["clip_upper"] = None
+                sent_records.append(sent_record)
+
+            def _topk_by(key: str, k: int):
+                values = [r.get(key) for r in sent_records]
+                idxs = list(range(len(values)))
+                idxs = [i for i in idxs if values[i] is not None]
+                idxs.sort(key=lambda j: values[j], reverse=True)
+                idxs = idxs[: k]
+                return [
+                    {
+                        "sentence_index": int(j),
+                        "sentence_id": int(sent_records[j]["sentence_id"]),
+                        "value": float(values[j]),
+                        "position": float(j / max(len(sent_records), 1)),
+                    }
+                    for j in idxs
+                ]
+
+            sent_lengths = [r["token_count"] for r in sent_records]
+            sent_ppls = [r["ppl"] for r in sent_records if r.get("ppl") is not None]
+            sent_ents = [r["entropy"] for r in sent_records if r.get("entropy") is not None]
+            sent_deltas = [r["sum_log_ratio"] for r in sent_records if r.get("sum_log_ratio") is not None]
+            sent_kls = [r["kl_old"] for r in sent_records if r.get("kl_old") is not None]
+
+            response_sentence_clipped = None
+            if loss_mode == "sentencepo" and sent_records:
+                response_sentence_clipped = any(
+                    (r.get("clipped") is True) for r in sent_records if "clipped" in r
+                )
+
+            resp_ppl = None
+            if row_logp_old is not None:
+                resp_ppl = float(torch.exp(-(row_logp_old[row_mask].mean())).item()) if seq_len > 0 else 0.0
+            resp_entropy = None
+            if row_entropy is not None:
+                resp_entropy = float(row_entropy[row_mask].mean().item()) if seq_len > 0 else 0.0
+
+            reward_val = float(rewards[i].item()) if rewards is not None else None
+
+            records.append(
+                {
+                    "uid": str(batch.non_tensor_batch.get("uid", [""] * bs)[i]),
+                    "reward": reward_val,
+                    "response_len": seq_len,
+                    "response_ppl": resp_ppl,
+                    "response_entropy": resp_entropy,
+                    "sentence_count": len(sent_records),
+                    "seq_ratio": seq_ratio,
+                    "response_clipped": response_clipped,
+                    "response_sentence_clipped": response_sentence_clipped,
+                    "sentence_stats": {
+                        "len_mean": float(np.mean(sent_lengths)) if sent_lengths else 0.0,
+                        "len_var": float(np.var(sent_lengths)) if sent_lengths else 0.0,
+                        "ppl_mean": float(np.mean(sent_ppls)) if sent_ppls else 0.0,
+                        "ppl_var": float(np.var(sent_ppls)) if sent_ppls else 0.0,
+                        "entropy_mean": float(np.mean(sent_ents)) if sent_ents else 0.0,
+                        "entropy_var": float(np.var(sent_ents)) if sent_ents else 0.0,
+                        "delta_sum_mean": float(np.mean(sent_deltas)) if sent_deltas else 0.0,
+                        "delta_sum_var": float(np.var(sent_deltas)) if sent_deltas else 0.0,
+                        "kl_old_mean": float(np.mean(sent_kls)) if sent_kls else 0.0,
+                        "kl_old_var": float(np.var(sent_kls)) if sent_kls else 0.0,
+                    },
+                    "topk": {
+                        "ppl": _topk_by("ppl", top_k),
+                        "entropy": _topk_by("entropy", top_k),
+                        "length": _topk_by("token_count", top_k),
+                        "delta_sum": _topk_by("sum_log_ratio", top_k),
+                        "kl_old": _topk_by("kl_old", top_k),
+                    },
+                    "sentences": sent_records,
+                }
+            )
+
+        return records
+
+    def _dump_sentence_analysis(
+        self,
+        batch: DataProto,
+        log_prob_new: torch.Tensor,
+        old_log_prob: torch.Tensor | None,
+        entropys: torch.Tensor | None,
+        ref_log_prob: torch.Tensor | None,
+        dump_path: str,
+        max_samples: int,
+        loss_mode: str,
+        top_k: int,
+        group_by_uid: bool,
+    ):
+        os.makedirs(dump_path, exist_ok=True)
+        split_name = "val" if batch.meta_info.get("validate", False) else "train"
+        split_dir = os.path.join(dump_path, split_name)
+        os.makedirs(split_dir, exist_ok=True)
+        records = self._build_sentence_analysis_records(
+            batch=batch,
+            log_prob_new=log_prob_new,
+            old_log_prob=old_log_prob,
+            entropys=entropys,
+            ref_log_prob=ref_log_prob,
+            max_samples=max_samples,
+            loss_mode=loss_mode,
+            top_k=top_k,
+        )
+        if not records:
+            return
+
+        if group_by_uid:
+            by_uid: dict[str, list[dict[str, Any]]] = {}
+            for rec in records:
+                by_uid.setdefault(rec.get("uid", "unknown"), []).append(rec)
+            for uid, recs in by_uid.items():
+                uid_dir = os.path.join(split_dir, uid)
+                os.makedirs(uid_dir, exist_ok=True)
+                filename = os.path.join(uid_dir, f"{self.global_steps}.jsonl")
+                with open(filename, "w") as f:
+                    for rec in recs:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                print(f"Dumped sentence analysis to {filename}")
+        else:
+            filename = os.path.join(split_dir, f"{self.global_steps}.jsonl")
+            with open(filename, "w") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(f"Dumped sentence analysis to {filename}")
+
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
@@ -543,6 +1203,10 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            if "judge_outputs" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump["self_judge_output"] = batch.non_tensor_batch["judge_outputs"].tolist()
+            if "judge_prompts" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump["self_judge_prompt"] = batch.non_tensor_batch["judge_prompts"].tolist()
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_dict.setdefault(
                     "request_id",
@@ -610,6 +1274,8 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_resp_lens = []
+        sample_prompt_lens = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -634,6 +1300,8 @@ class RayPPOTrainer:
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            sample_prompt_lens.extend([int((ids != pad_id).sum().item()) for ids in input_ids])
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -672,6 +1340,8 @@ class RayPPOTrainer:
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            sample_resp_lens.extend([int((ids != pad_id).sum().item()) for ids in output_ids])
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -683,6 +1353,65 @@ class RayPPOTrainer:
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
+            # attach rewards and tokenizer ids for downstream analysis
+            test_batch.batch["token_level_scores"] = reward_tensor
+            test_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
+            test_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
+
+            # Optional sentence analysis on validation samples
+            sentence_analysis_cfg = self.config.trainer.get("sentence_analysis", {}) or {}
+            enable_sentence_analysis = bool(sentence_analysis_cfg.get("enable", False))
+            if enable_sentence_analysis:
+                loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+                top_k = int(sentence_analysis_cfg.get("top_k", 3) or 3)
+                group_by_uid = bool(sentence_analysis_cfg.get("group_by_uid", True))
+                min_sent_tokens = 6
+                if hasattr(self.config, "data"):
+                    min_sent_tokens = self.config.data.get(
+                        "min_sent_tokens", self.config.data.get("sentencepo_min_sent_tokens", 6)
+                    )
+                response_mask = compute_response_mask(test_batch)
+                test_batch.batch["response_mask"] = response_mask
+                test_batch.batch["sentence_ids"] = build_sentence_ids_from_responses(
+                    tokenizer=self.tokenizer,
+                    responses=test_batch.batch["responses"],
+                    response_mask=response_mask,
+                    min_sent_tokens=min_sent_tokens,
+                )
+                # compute log-prob with padding to be divisible by dp size
+                size_divisor = (
+                    self.actor_rollout_wg.world_size
+                    if not self.async_rollout_mode
+                    else self.config.actor_rollout_ref.rollout.agent.num_workers
+                )
+                test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, size_divisor)
+                log_prob_new_dp_padded = self.actor_rollout_wg.compute_log_prob(test_batch_padded)
+                log_prob_new_dp = unpad_dataproto(log_prob_new_dp_padded, pad_size=pad_size)
+                if "log_probs" not in log_prob_new_dp.batch.keys():
+                    raise KeyError(
+                        "compute_log_prob output is missing 'log_probs'. Please ensure actor compute_log_prob "
+                        "returns log_probs for analysis."
+                    )
+                log_prob_new = log_prob_new_dp.batch.get("log_probs")
+                ent_new = log_prob_new_dp.batch.get("entropys")
+                analysis_dir = sentence_analysis_cfg.get("dir", None)
+                if analysis_dir is None:
+                    analysis_dir = os.path.join(
+                        self.config.trainer.get("validation_data_dir", ""), "sentence_analysis"
+                    )
+                if analysis_dir and log_prob_new is not None:
+                    self._dump_sentence_analysis(
+                        batch=test_batch,
+                        log_prob_new=log_prob_new,
+                        old_log_prob=None,
+                        entropys=ent_new,
+                        ref_log_prob=None,
+                        dump_path=analysis_dir,
+                        max_samples=int(sentence_analysis_cfg.get("max_samples", 8) or 8),
+                        loss_mode=loss_mode,
+                        top_k=top_k,
+                        group_by_uid=group_by_uid,
+                    )
 
             reward_extra_infos_dict["reward"].extend(scores)
             print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
@@ -739,6 +1468,77 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        # response length bucket accuracy on validation
+        if sample_resp_lens:
+            resp_lens = np.array(sample_resp_lens)
+            scores_np = np.array(sample_scores)
+            bins = self.config.trainer.get("response_len_bins", [64, 128, 256, 512])
+            prev = 0
+            for b in bins:
+                m = (resp_lens > prev) & (resp_lens <= b)
+                if np.any(m):
+                    metric_dict[f"val-aux/resp_len_bucket/{prev+1}-{b}/acc"] = scores_np[m].mean().item()
+                    metric_dict[f"val-aux/resp_len_bucket/{prev+1}-{b}/count"] = int(m.sum())
+                prev = b
+            m = resp_lens > prev
+            if np.any(m):
+                metric_dict[f"val-aux/resp_len_bucket/{prev+1}+/acc"] = scores_np[m].mean().item()
+                metric_dict[f"val-aux/resp_len_bucket/{prev+1}+/count"] = int(m.sum())
+
+        # prompt length stratified response length accuracy
+        if sample_prompt_lens and sample_resp_lens:
+            prompt_lens = np.array(sample_prompt_lens)
+            resp_lens = np.array(sample_resp_lens)
+            scores_np = np.array(sample_scores)
+            prompt_bins = self.config.trainer.get("prompt_len_bins", [64, 128, 256, 512])
+            resp_bins = self.config.trainer.get("response_len_bins", [64, 128, 256, 512])
+            prev_p = 0
+            for pb in prompt_bins:
+                mp = (prompt_lens > prev_p) & (prompt_lens <= pb)
+                if np.any(mp):
+                    prev_r = 0
+                    for rb in resp_bins:
+                        mr = mp & (resp_lens > prev_r) & (resp_lens <= rb)
+                        if np.any(mr):
+                            metric_dict[
+                                f"val-aux/resp_len_by_prompt_len/{prev_p+1}-{pb}/{prev_r+1}-{rb}/acc"
+                            ] = scores_np[mr].mean().item()
+                            metric_dict[
+                                f"val-aux/resp_len_by_prompt_len/{prev_p+1}-{pb}/{prev_r+1}-{rb}/count"
+                            ] = int(mr.sum())
+                        prev_r = rb
+                    mr = mp & (resp_lens > prev_r)
+                    if np.any(mr):
+                        metric_dict[
+                            f"val-aux/resp_len_by_prompt_len/{prev_p+1}-{pb}/{prev_r+1}+/acc"
+                        ] = scores_np[mr].mean().item()
+                        metric_dict[
+                            f"val-aux/resp_len_by_prompt_len/{prev_p+1}-{pb}/{prev_r+1}+/count"
+                        ] = int(mr.sum())
+                prev_p = pb
+
+        # within-prompt length vs correctness correlation
+        if sample_uids and sample_resp_lens:
+            uid_arr = np.array(sample_uids)
+            resp_lens = np.array(sample_resp_lens)
+            scores_np = np.array(sample_scores)
+            corr_vals = []
+            for uid in np.unique(uid_arr):
+                m = uid_arr == uid
+                if m.sum() < 2:
+                    continue
+                x = resp_lens[m]
+                y = scores_np[m]
+                if np.std(x) == 0 or np.std(y) == 0:
+                    continue
+                corr = np.corrcoef(x, y)[0, 1]
+                if not np.isnan(corr):
+                    corr_vals.append(corr)
+            if corr_vals:
+                metric_dict["val-aux/len_correct_corr/mean"] = float(np.mean(corr_vals))
+                metric_dict["val-aux/len_correct_corr/std"] = float(np.std(corr_vals))
+                metric_dict["val-aux/len_correct_corr/count"] = int(len(corr_vals))
 
         return metric_dict
 
@@ -1171,7 +1971,11 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    if loss_mode == "sentencepo":
+                    sentence_analysis_cfg = self.config.trainer.get("sentence_analysis", {}) or {}
+                    enable_sentence_analysis = bool(sentence_analysis_cfg.get("enable", False))
+                    sentence_adv_cfg = getattr(self.config.algorithm, "sentence_adv", None)
+                    enable_sentence_adv = bool(getattr(sentence_adv_cfg, "enable", False))
+                    if loss_mode in {"sentencepo", "gspo"} or enable_sentence_analysis or enable_sentence_adv:
                         if hasattr(self.config, "data"):
                             min_sent_tokens = self.config.data.get(
                                 "min_sent_tokens", self.config.data.get("sentencepo_min_sent_tokens", 6)
@@ -1214,6 +2018,11 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        sentence_adv_cfg = getattr(self.config.algorithm, "sentence_adv", None)
+                        if sentence_adv_cfg is not None and getattr(sentence_adv_cfg, "enable", False):
+                            batch.meta_info["return_hidden_states"] = True
+                            batch.meta_info["sentence_adv_pool_only"] = True
+                            batch.meta_info["return_last_hidden_state_only"] = True
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
@@ -1221,7 +2030,7 @@ class RayPPOTrainer:
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
-                        if loss_mode == "sentencepo" and "sentence_ids" in batch.batch:
+                        if loss_mode in {"sentencepo", "gspo"} and "sentence_ids" in batch.batch:
                             sentencepo_stats = compute_sentencepo_metrics(
                                 sentence_ids=batch.batch["sentence_ids"],
                                 response_mask=response_masks,
@@ -1230,8 +2039,15 @@ class RayPPOTrainer:
                                 hist_every=sp_hist_every,
                                 hist_max_points=sp_hist_max_points,
                                 global_step=self.global_steps,
+                                prefix="sentencepo" if loss_mode == "sentencepo" else "gspo_sentence",
                             )
                             metrics.update(sentencepo_stats)
+                        policy_loss_cfg = getattr(self.config.actor_rollout_ref.actor, "policy_loss", None)
+                        enable_sent_entropy_adv = bool(
+                            getattr(policy_loss_cfg, "sentencepo_adv_entropy_enable", False)
+                        ) if policy_loss_cfg is not None else False
+                        if enable_sent_entropy_adv:
+                            batch.batch["entropys"] = entropys
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
@@ -1275,6 +2091,22 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
+                        # Self-judge outputs (using current actor weights)
+                        sentence_judge_cfg = getattr(self.config.algorithm, "sentence_judge_adv", None)
+                        if sentence_judge_cfg is not None and getattr(sentence_judge_cfg, "enable", False):
+                            backend = str(getattr(sentence_judge_cfg, "judge_backend", "dummy") or "dummy").lower()
+                            if backend in {"self", "actor"}:
+                                every_n_steps = int(getattr(sentence_judge_cfg, "every_n_steps", 1) or 1)
+                                if every_n_steps <= 1 or (self.global_steps % every_n_steps == 0):
+                                    judge_result = self._generate_self_judge_outputs(batch, sentence_judge_cfg)
+                                    if judge_result is not None:
+                                        batch.non_tensor_batch["judge_outputs"] = np.array(
+                                            judge_result["judge_outputs"], dtype=object
+                                        )
+                                        batch.non_tensor_batch["judge_prompts"] = np.array(
+                                            judge_result["judge_prompts"], dtype=object
+                                        )
+
                         # Compute rollout importance sampling weights centrally (once per batch)
                         # This corrects for mismatch between rollout policy and training policy
                         # Also computes mismatch metrics (KL, PPL, etc.)
@@ -1295,7 +2127,14 @@ class RayPPOTrainer:
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
+                            tokenizer=self.tokenizer,
                         )
+                        sentence_adv_metrics = batch.meta_info.pop("sentence_adv_metrics", None)
+                        if sentence_adv_metrics:
+                            metrics.update(sentence_adv_metrics)
+                        sentence_judge_metrics = batch.meta_info.pop("sentence_judge_adv_metrics", None)
+                        if sentence_judge_metrics:
+                            metrics.update(sentence_judge_metrics)
 
                     # update critic
                     if self.use_critic:
@@ -1312,6 +2151,43 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                    # Optional: dump per-sample sentence analysis (after update for fresh log_probs)
+                    sentence_analysis_cfg = self.config.trainer.get("sentence_analysis", {}) or {}
+                    enable_sentence_analysis = bool(sentence_analysis_cfg.get("enable", False))
+                    max_samples = int(sentence_analysis_cfg.get("max_samples", 8) or 8)
+                    top_k = int(sentence_analysis_cfg.get("top_k", 3) or 3)
+                    group_by_uid = bool(sentence_analysis_cfg.get("group_by_uid", True))
+                    if enable_sentence_analysis and "sentence_ids" in batch.batch:
+                        analysis_dir = sentence_analysis_cfg.get("dir", None)
+                        if analysis_dir is None:
+                            analysis_dir = os.path.join(
+                                self.config.trainer.get("rollout_data_dir", ""), "sentence_analysis"
+                            )
+                        if analysis_dir:
+                            with marked_timer("sentence_analysis", timing_raw, color="green"):
+                                log_prob_new_dp = self.actor_rollout_wg.compute_log_prob(batch)
+                                log_prob_new = log_prob_new_dp.batch.get("log_probs")
+                                if log_prob_new is None:
+                                    log_prob_new = log_prob_new_dp.batch.get("old_log_probs")
+                                ent_new = log_prob_new_dp.batch.get("entropys")
+                                ref_lp = batch.batch.get("ref_log_prob")
+                                old_lp = batch.batch.get("old_log_probs")
+                                if old_lp is None:
+                                    old_lp = batch.batch.get("log_probs")
+                                if log_prob_new is not None and old_lp is not None:
+                                    self._dump_sentence_analysis(
+                                        batch=batch,
+                                        log_prob_new=log_prob_new,
+                                        old_log_prob=old_lp,
+                                        entropys=ent_new,
+                                        ref_log_prob=ref_lp,
+                                        dump_path=analysis_dir,
+                                        max_samples=max_samples,
+                                        loss_mode=loss_mode,
+                                        top_k=top_k,
+                                        group_by_uid=group_by_uid,
+                                    )
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

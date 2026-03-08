@@ -133,3 +133,5 @@ models
 
 # flash_attn and flashinfer
 flash*
+
+test.py

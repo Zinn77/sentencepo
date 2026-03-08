@@ -28,19 +28,26 @@ except Exception:  # pragma: no cover - torch may be unavailable in some envs
 def _to_scalar_list(val: list[Any]) -> list[float]:
     scalars: list[float] = []
     for v in val:
+        if v is None:
+            continue
         if torch is not None and isinstance(v, torch.Tensor):
             if v.numel() == 0:
                 continue
-            scalars.append(float(v.detach().float().mean().item()))
+            if hasattr(torch, "nanmean"):
+                scalars.append(float(torch.nanmean(v.detach().float()).item()))
+            else:
+                scalars.append(float(v.detach().float().mean().item()))
         elif isinstance(v, np.ndarray):
             if v.size == 0:
                 continue
-            scalars.append(float(np.mean(v)))
+            scalars.append(float(np.nanmean(v)))
         elif isinstance(v, (list, tuple)):
             if len(v) == 0:
                 continue
-            scalars.append(float(np.mean(v)))
+            scalars.append(float(np.nanmean(v)))
         else:
+            if isinstance(v, (float, np.floating)) and np.isnan(v):
+                continue
             scalars.append(float(v))
     return scalars
 

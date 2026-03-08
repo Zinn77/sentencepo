@@ -17,7 +17,13 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "SentenceAdvConfig",
+    "SentenceJudgeAdvConfig",
+]
 
 
 @dataclass
@@ -54,6 +60,72 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class SentenceAdvConfig(BaseConfig):
+    """Configuration for sentence-level semantic advantage.
+
+    Args:
+        enable (bool): Enable sentence-level semantic advantage.
+        alpha (float): Weight to fuse sentence advantage into base advantages.
+        temperature (float): Softmax temperature for similarity.
+        pooling (str): Sentence embedding pooling: "mean" or "last".
+        normalize (bool): Whether to z-normalize sentence advantages within bucket.
+        eps (float): Numerical stability epsilon.
+        correctness_threshold (float): Threshold on sequence reward to define correctness.
+        bucket_count (int): Number of relative-position buckets per response.
+        metrics_enable (bool): Whether to emit extra semantic metrics.
+    """
+
+    enable: bool = False
+    alpha: float = 0.1
+    temperature: float = 0.1
+    pooling: str = "last"
+    normalize: bool = True
+    eps: float = 1e-8
+    correctness_threshold: float = 0.0
+    bucket_count: int = 3
+    metrics_enable: bool = True
+
+
+@dataclass
+class SentenceJudgeAdvConfig(BaseConfig):
+    """Configuration for sentence-level judge advantage shaping.
+
+    Args:
+        enable (bool): Enable sentence-level judge advantage shaping.
+        alpha (float): Weight to fuse judge advantage into base advantages.
+        buckets (list[float]): Discrete advantage buckets.
+        use_confidence_weight (bool): Whether to weight by judge confidence.
+        confidence_floor (float): Confidence floor for keeping a sentence signal.
+        normalize (str): Normalization mode: "none" or "zscore".
+        correctness_threshold (float): Threshold on sequence reward to define correctness.
+        judge_backend (str): Judge backend: "dummy", "callable", "self".
+            every_n_steps (int): Run judge every N steps (1 = every step).
+        judge_fn (Optional[str]): Import path of a callable judge function.
+        max_sentences (int): Max sentences passed to judge (0 = no limit).
+        max_chars (int): Max characters passed to judge (0 = no limit).
+        judge_max_tokens (int): Max tokens to generate for judge output.
+        rate_limit_qps (float): QPS rate limit for judge calls.
+        debug_prompt (bool): Whether to include rendered prompt in debug.
+    """
+
+    enable: bool = False
+    alpha: float = 0.05
+    buckets: list[float] = field(default_factory=lambda: [0.75, 0.25, 0.0, -0.25, -0.75])
+    use_confidence_weight: bool = True
+    confidence_floor: float = 0.2
+    normalize: str = "zscore"
+    correctness_threshold: float = 0.0
+    judge_backend: str = "dummy"
+    judge_fn: Optional[str] = None
+    every_n_steps: int = 1
+    max_sentences: int = 0
+    max_chars: int = 0
+    judge_max_tokens: int = 256
+    rate_limit_qps: float = 0.0
+    debug_prompt: bool = False
 
 
 @dataclass
@@ -103,3 +175,5 @@ class AlgoConfig(BaseConfig):
     # Controls whether to apply IS weights to policy loss (only if rollout_is_threshold is set)
     # True = apply weights to loss, False = compute metrics only (no weight application)
     rollout_is: bool = False
+    sentence_adv: Optional[SentenceAdvConfig] = None
+    sentence_judge_adv: Optional[SentenceJudgeAdvConfig] = None

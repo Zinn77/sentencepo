@@ -135,6 +135,57 @@ algorithm:
   # Useful for monitoring mismatch before enabling correction
   rollout_is: false
 
+  # Sentence-level judge advantage shaping (Sentence Judge Advantage)
+  sentence_judge_adv:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.SentenceJudgeAdvConfig
+
+    # Enable sentence judge advantage shaping
+    enable: false
+
+    # Weight to fuse judge advantage into base advantages
+    alpha: 0.05
+
+    # Discrete advantage buckets
+    buckets: [0.75, 0.25, 0.0, -0.25, -0.75]
+
+    # Whether to weight by judge confidence
+    use_confidence_weight: true
+
+    # Confidence floor for keeping a sentence signal
+    confidence_floor: 0.2
+
+    # Normalization mode: none / zscore
+    normalize: zscore
+
+    # Threshold on sequence reward to define correctness
+    correctness_threshold: 0.0
+
+    # Judge backend: dummy / callable / self
+    judge_backend: dummy
+
+    # Import path for a callable judge function (for local/api backends)
+    judge_fn: null
+
+    # Run judge every N steps (1 = every step)
+    every_n_steps: 1
+
+    # Max sentences passed to judge (0 = no limit)
+    max_sentences: 0
+
+    # Max characters passed to judge (0 = no limit)
+    max_chars: 0
+
+    # Max tokens to generate for judge output
+    judge_max_tokens: 256
+
+    # Rate limit in QPS for judge calls
+    rate_limit_qps: 0.0
+
+    # Whether to include rendered judge prompt in debug
+    debug_prompt: false
+
 # config for the trainer
 trainer:
 

@@ -170,7 +170,14 @@ def fit(self):
                         num_repeat=self.config.actor_rollout_ref.rollout.n,
                         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                         config=self.config.algorithm,
+                        tokenizer=self.tokenizer,
                     )
+                    sentence_adv_metrics = batch.meta_info.pop("sentence_adv_metrics", None)
+                    if sentence_adv_metrics:
+                        metrics.update(sentence_adv_metrics)
+                    sentence_judge_metrics = batch.meta_info.pop("sentence_judge_adv_metrics", None)
+                    if sentence_judge_metrics:
+                        metrics.update(sentence_judge_metrics)
 
                 # implement critic warmup
                 if self.config.trainer.critic_warmup <= self.global_steps:

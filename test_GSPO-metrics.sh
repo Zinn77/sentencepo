@@ -35,13 +35,26 @@ micro_batch_size=4
 clip_ratio_low=0.0003
 clip_ratio_high=0.0004
 
-TOT_DIR=$HOME/autodl-tmp/models_v1-1/gspo_${DS}_${MODEL_NAME}_ep${EPOCHS}
+# 诊断与可视化开关
+enable_sentence_analysis=${enable_sentence_analysis:-true}
+sentence_analysis_max_samples=${sentence_analysis_max_samples:-4096}
+sentence_analysis_top_k=${sentence_analysis_top_k:-3}
+sentence_analysis_group_by_uid=${sentence_analysis_group_by_uid:-true}
+response_len_bins=${response_len_bins:-"[128,256,512,1024,2048,4096]"}
+prompt_len_bins=${prompt_len_bins:-"[64,128,256,512,1024]"}
+analysis_response_len_bins=${analysis_response_len_bins:-"[128,256,512,1024,2048,4096]"}
+analysis_sentence_count_bins=${analysis_sentence_count_bins:-"[4,8,16,32,64]"}
+analysis_max_sentence_len_bins=${analysis_max_sentence_len_bins:-"[32,64,128,256,512]"}
+
+TOT_DIR=$HOME/autodl-tmp/models_v1-1-metrics/gspo_${DS}_${MODEL_NAME}_ep${EPOCHS}
 mkdir -p $TOT_DIR
 mkdir -p $TOT_DIR/verl_checkpoints_gspo
 
-cd $HOME/sentencepo_v1-1
+sentence_analysis_dir=${sentence_analysis_dir:-"$TOT_DIR/sentence_analysis"}
 
-PYTHONPATH=$HOME/sentencepo_v1-1 \
+cd $HOME/sentencepo_v1-1-metrics
+
+PYTHONPATH=$HOME/sentencepo_v1-1-metrics \
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
@@ -80,6 +93,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_num_batched_tokens=$max_num_batched_tokens \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$micro_batch_size \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    +actor_rollout_ref.actor.policy_loss.analysis_bins.response_len_bins=$analysis_response_len_bins \
+    +actor_rollout_ref.actor.policy_loss.analysis_bins.sentence_count_bins=$analysis_sentence_count_bins \
+    +actor_rollout_ref.actor.policy_loss.analysis_bins.max_sentence_len_bins=$analysis_max_sentence_len_bins \
     actor_rollout_ref.actor.checkpoint.save_contents='["model"]' \
     actor_rollout_ref.actor.checkpoint.load_contents='["model"]' \
     critic.checkpoint.save_contents='["model"]' \
@@ -95,4 +111,12 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.test_freq=5 \
     trainer.total_epochs=$EPOCHS \
     trainer.default_local_dir=$TOT_DIR/verl_checkpoints_gspo \
+    trainer.use_legacy_worker_impl=disable \
+    +trainer.response_len_bins=$response_len_bins \
+    +trainer.prompt_len_bins=$prompt_len_bins \
+    +trainer.sentence_analysis.enable=$enable_sentence_analysis \
+    +trainer.sentence_analysis.max_samples=$sentence_analysis_max_samples \
+    +trainer.sentence_analysis.top_k=$sentence_analysis_top_k \
+    +trainer.sentence_analysis.group_by_uid=$sentence_analysis_group_by_uid \
+    +trainer.sentence_analysis.dir=$sentence_analysis_dir \
     "$@" 2>&1 | tee $TOT_DIR/verl_gspo.log

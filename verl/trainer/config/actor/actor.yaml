@@ -65,6 +65,24 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Enable sentence-level entropy shaping on advantages
+  sentencepo_adv_entropy_enable: false
+
+  # Scaling strength for positive-advantage sentences
+  sentencepo_adv_entropy_alpha_pos: 0.1
+
+  # Scaling strength for negative-advantage sentences
+  sentencepo_adv_entropy_alpha_neg: 0.0
+
+  # Normalization mode for sentence entropy: zscore / minmax / none
+  sentencepo_adv_entropy_norm: zscore
+
+  # Clamp for normalized sentence entropy
+  sentencepo_adv_entropy_clip: 2.0
+
+  # Epsilon for entropy normalization stability
+  sentencepo_adv_entropy_eps: 1e-6
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

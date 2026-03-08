@@ -128,10 +128,16 @@ class ActorWorker(Worker, DistProfilerExtension):
             entropy = output["entropy"]
             if entropy is not None:
                 entropy = no_padding_2_padding(entropy, data)  # (bsz, response_length)
+            else:
+                entropy = torch.zeros_like(log_probs)
 
             # in megatron, only last pp contains valid data and returned to the single controller
             output = DataProto.from_dict(
-                tensors={"old_log_probs": log_probs.float(), "entropy": entropy.float()},
+                tensors={
+                    "log_probs": log_probs.float(),
+                    "old_log_probs": log_probs.float(),
+                    "entropys": entropy.float(),
+                },
             )
             output = output.to("cpu")
         return output

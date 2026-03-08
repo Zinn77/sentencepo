@@ -85,38 +85,8 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def _find_last_transformer_block(self) -> nn.Module | None:
-        module = getattr(self.actor_module, "_fsdp_wrapped_module", self.actor_module)
-        candidates = (
-            ("model", "layers"),
-            ("model", "h"),
-            ("transformer", "h"),
-            ("transformer", "layers"),
-            ("transformer", "blocks"),
-            ("gpt_neox", "layers"),
-            ("decoder", "layers"),
-        )
-        for path in candidates:
-            obj = module
-            ok = True
-            for attr in path:
-                if not hasattr(obj, attr):
-                    ok = False
-                    break
-                obj = getattr(obj, attr)
-            if not ok:
-                continue
-            if isinstance(obj, (nn.ModuleList, list, tuple)) and len(obj) > 0:
-                return obj[-1]
-        return None
-
     def _forward_micro_batch(
-        self,
-        micro_batch,
-        temperature,
-        calculate_entropy=False,
-        return_hidden_states: bool = False,
-        return_last_hidden_state_only: bool = False,
+        self, micro_batch, temperature, calculate_entropy=False, return_hidden_states: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Returns:
@@ -138,25 +108,8 @@ class DataParallelPPOActor(BasePPOActor):
             position_ids = micro_batch["position_ids"]
             entropy = None
             hidden_states = None
-            hook_handle = None
-            last_hidden = None
-            use_hook = False
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)
-
-            if return_hidden_states and return_last_hidden_state_only:
-                block = self._find_last_transformer_block()
-                if block is not None:
-                    use_hook = True
-
-                    def _hook(_module, _inputs, output):
-                        nonlocal last_hidden
-                        if isinstance(output, tuple):
-                            last_hidden = output[0]
-                        else:
-                            last_hidden = output
-
-                    hook_handle = block.register_forward_hook(_hook)
 
             if self.use_remove_padding:
                 input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
@@ -212,7 +165,7 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
-                if return_hidden_states and not use_hook:
+                if return_hidden_states:
                     extra_args["output_hidden_states"] = True
 
                 output = self.actor_module(
@@ -229,7 +182,7 @@ class DataParallelPPOActor(BasePPOActor):
                     log_probs = output.log_probs.squeeze(0)
                     if calculate_entropy:
                         entropy_rmpad = output.entropy.squeeze(0)
-                    if return_hidden_states and not use_hook and hasattr(output, "hidden_states"):
+                    if return_hidden_states and hasattr(output, "hidden_states"):
                         hidden_states_rmpad = output.hidden_states[-1].squeeze(0)
                 else:
                     logits_rmpad = output.logits.squeeze(0)
@@ -249,11 +202,8 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy_rmpad = torch.utils.checkpoint.checkpoint(
                                 self.compute_entropy_from_logits, logits_rmpad
                             )
-                    if return_hidden_states and not use_hook and hasattr(output, "hidden_states"):
+                    if return_hidden_states and hasattr(output, "hidden_states"):
                         hidden_states_rmpad = output.hidden_states[-1].squeeze(0)
-
-                if return_hidden_states and use_hook and last_hidden is not None:
-                    hidden_states_rmpad = last_hidden.squeeze(0)
 
                 if self.use_ulysses_sp:
                     log_probs = gather_outputs_and_unpad(
@@ -308,7 +258,7 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
-                if return_hidden_states and not use_hook:
+                if return_hidden_states:
                     extra_args["output_hidden_states"] = True
 
                 output = self.actor_module(
@@ -333,13 +283,8 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy = verl_F.entropy_from_logits(logits)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
-                if return_hidden_states and not use_hook and hasattr(output, "hidden_states"):
+                if return_hidden_states and hasattr(output, "hidden_states"):
                     hidden_states = output.hidden_states[-1][:, -response_length - 1 : -1, :]
-                if return_hidden_states and use_hook and last_hidden is not None:
-                    hidden_states = last_hidden[:, -response_length - 1 : -1, :]
-
-            if hook_handle is not None:
-                hook_handle.remove()
 
             return entropy, log_probs, hidden_states
 
@@ -388,7 +333,6 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
-        return_last_hidden_state_only = bool(data.meta_info.get("return_last_hidden_state_only", False))
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -413,7 +357,6 @@ class DataParallelPPOActor(BasePPOActor):
                     temperature=temperature,
                     calculate_entropy=calculate_entropy,
                     return_hidden_states=return_hidden_states,
-                    return_last_hidden_state_only=return_last_hidden_state_only,
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:

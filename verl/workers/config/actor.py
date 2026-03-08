@@ -49,6 +49,13 @@ class PolicyLossConfig(BaseConfig):
         sentencepo_cmax (float): Upper bound for adaptive clip scale.
         sentencepo_stats_eps (float): Epsilon for numerical stability in statistics.
         sentencepo_metrics_level (str): SentencePO metrics level: "full", "basic", or "off".
+        sentencepo_adv_entropy_enable (bool): Enable sentence-level entropy shaping on advantages.
+        sentencepo_adv_entropy_alpha_pos (float): Scaling strength for positive advantages.
+        sentencepo_adv_entropy_alpha_neg (float): Scaling strength for negative advantages.
+        sentencepo_adv_entropy_norm (str): Normalization mode for sentence entropy (zscore/minmax/none).
+        sentencepo_adv_entropy_clip (float): Clamp for normalized entropy value.
+        sentencepo_adv_entropy_eps (float): Epsilon for entropy normalization stability.
+        analysis_bins (dict): Optional bins for analysis (response_len_bins, sentence_count_bins, max_sentence_len_bins).
     """
 
     loss_mode: str = "vanilla"
@@ -66,6 +73,13 @@ class PolicyLossConfig(BaseConfig):
     sentencepo_cmax: float = 1.5
     sentencepo_stats_eps: float = 1e-6
     sentencepo_metrics_level: str = "full"
+    sentencepo_adv_entropy_enable: bool = False
+    sentencepo_adv_entropy_alpha_pos: float = 0.1
+    sentencepo_adv_entropy_alpha_neg: float = 0.0
+    sentencepo_adv_entropy_norm: str = "zscore"
+    sentencepo_adv_entropy_clip: float = 2.0
+    sentencepo_adv_entropy_eps: float = 1e-6
+    analysis_bins: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
