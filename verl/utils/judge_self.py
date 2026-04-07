@@ -22,9 +22,17 @@ import urllib.request
 from typing import Any
 
 
-def _post_json(url: str, payload: dict[str, Any], timeout_s: int) -> dict[str, Any]:
+def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    timeout_s: int,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=data, headers=req_headers)
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         body = resp.read().decode("utf-8")
     return json.loads(body)
@@ -53,6 +61,16 @@ def judge_fn(payload: dict[str, Any]) -> dict[str, Any]:
     if not model:
         raise RuntimeError("SJA_JUDGE_MODEL is required for judge_fn.")
 
+    api_key = (
+        os.environ.get("SJA_JUDGE_API_KEY", "")
+        or os.environ.get("DASHSCOPE_API_KEY", "")
+        or os.environ.get("OPENAI_API_KEY", "")
+    )
+    if "dashscope.aliyuncs.com" in base_url and not api_key:
+        raise RuntimeError(
+            "DashScope endpoint requires API key. Set SJA_JUDGE_API_KEY or DASHSCOPE_API_KEY."
+        )
+
     prompt = payload.get("extra", {}).get("rendered_prompt") or payload.get("prompt")
     if not prompt:
         raise RuntimeError("judge_fn requires rendered_prompt or prompt in payload.")
@@ -71,11 +89,12 @@ def judge_fn(payload: dict[str, Any]) -> dict[str, Any]:
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
 
     last_err: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            resp = _post_json(f"{base_url}/chat/completions", body, timeout_s=timeout_s)
+            resp = _post_json(f"{base_url}/chat/completions", body, timeout_s=timeout_s, headers=headers)
             content = resp["choices"][0]["message"]["content"]
             return _extract_json(content)
         except (KeyError, IndexError, ValueError, urllib.error.URLError) as exc:

@@ -61,6 +61,8 @@ class DataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self._judge_sft_iterator = None
+        self._judge_sft_lambda = 0.0
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -437,6 +439,46 @@ class DataParallelPPOActor(BasePPOActor):
             hidden_states = torch.concat(hidden_states_lst, dim=0)
 
         return log_probs, entropys, hidden_states
+
+    def init_judge_sft(self, tokenizer, data_path: str, lambda_weight: float,
+                        micro_batch_size: int, max_seq_len: int):
+        """Initialize judge SFT data iterator for mixed loss during RL training."""
+        from verl.workers.actor.judge_sft_data import JudgeSFTIterator, prepare_judge_sft_data
+
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        samples = prepare_judge_sft_data(tokenizer, data_path, max_seq_len=max_seq_len)
+        self._judge_sft_iterator = JudgeSFTIterator(samples, micro_batch_size, pad_token_id=pad_token_id)
+        self._judge_sft_lambda = lambda_weight
+        if torch.distributed.get_rank() == 0:
+            print(f"[JudgeSFT] Initialized: {len(samples)} samples, lambda={lambda_weight}, "
+                  f"micro_bs={micro_batch_size}, max_seq_len={max_seq_len}")
+
+    def _compute_judge_sft_loss(self, device) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute cross-entropy SFT loss on a micro-batch of judge data."""
+        batch = self._judge_sft_iterator.next_batch(device)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]
+
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            output = self.actor_module(input_ids=input_ids, attention_mask=attention_mask)
+            logits = output.logits
+
+            # Causal LM shift: predict next token
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        metrics = {
+            "judge_sft/loss": loss.detach().item(),
+            "judge_sft/lambda": self._judge_sft_lambda,
+        }
+        return loss, metrics
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -895,6 +937,13 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+
+                    # Optional judge SFT mixed loss
+                    if self._judge_sft_iterator is not None and self._judge_sft_lambda > 0:
+                        judge_sft_loss, judge_sft_metrics = self._compute_judge_sft_loss(loss.device)
+                        loss = loss + self._judge_sft_lambda * judge_sft_loss * loss_scale_factor
+                        micro_batch_metrics.update(judge_sft_metrics)
+
                     loss.backward()
 
                     def _to_scalar(x):

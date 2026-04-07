@@ -100,9 +100,17 @@ class CallableJudgeClient(BaseJudgeClient):
 
 
 def _import_from_path(path: str) -> Callable[[dict[str, Any]], Any]:
-    if not path or "." not in path:
+    if not path:
         raise JudgeClientError(f"Invalid judge_fn path: {path}")
-    mod_name, attr = path.rsplit(".", 1)
+
+    # Support both legacy "module.attr" and common "module:attr" syntaxes.
+    if ":" in path:
+        mod_name, attr = path.rsplit(":", 1)
+    elif "." in path:
+        mod_name, attr = path.rsplit(".", 1)
+    else:
+        raise JudgeClientError(f"Invalid judge_fn path: {path}")
+
     module = importlib.import_module(mod_name)
     fn = getattr(module, attr, None)
     if fn is None or not callable(fn):

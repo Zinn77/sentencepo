@@ -11,7 +11,7 @@ export FLASH_ATTENTION_DETERMINISTIC=1
 TOT_PATH="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/yangfengkai02"
 
 # 将 verl 仓库目录添加到 Python 模块搜索路径
-export PYTHONPATH="${TOT_PATH}/sentencepo_v1-4-metrics:$PYTHONPATH"
+export PYTHONPATH="${TOT_PATH}/sentencepo_v1-4-metrics-sft:$PYTHONPATH"
 
 # 数据集设置
 math_train_path=${TOT_PATH}/data/math/train.parquet
@@ -98,6 +98,13 @@ sentence_judge_debug_prompt=${sentence_judge_debug_prompt:-false}
 sentence_judge_every_n_steps=${sentence_judge_every_n_steps:-1}
 sentence_judge_truncate_prompt=${sentence_judge_truncate_prompt:-true}
 
+# Judge SFT 混合损失（在 RL 训练中持续进化打分能力）
+judge_sft_enable=${judge_sft_enable:-false}
+judge_sft_data_path=${judge_sft_data_path:-""}  # 蒸馏后的 parquet 文件路径
+judge_sft_lambda=${judge_sft_lambda:-0.1}
+judge_sft_micro_batch_size=${judge_sft_micro_batch_size:-2}
+judge_sft_max_seq_len=${judge_sft_max_seq_len:-2048}
+
 # 诊断与可视化开关
 enable_sentence_analysis=${enable_sentence_analysis:-false}
 sentence_analysis_max_samples=${sentence_analysis_max_samples:-8}
@@ -111,7 +118,7 @@ analysis_max_sentence_len_bins=${analysis_max_sentence_len_bins:-"[32,64,128,256
 
 
 # 创建tensorboard日志目录，不存在则创建，防止日志丢失
-ts_dir="${TOT_PATH}/models_v1-4-metrics/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}_epsbase${sentencepo_eps_base}_Lppl${sentencepo_lambda_ppl}_Llen${sentencepo_lambda_len}_cmin${sentencepo_cmin}_cmax${sentencepo_cmax}_min-token${sentencepo_min_sent_tokens}"
+ts_dir="${TOT_PATH}/models_v1-4-metrics-sft/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}_epsbase${sentencepo_eps_base}_Lppl${sentencepo_lambda_ppl}_Llen${sentencepo_lambda_len}_cmin${sentencepo_cmin}_cmax${sentencepo_cmax}_min-token${sentencepo_min_sent_tokens}"
 if [[ "$sentencepo_adv_entropy_enable" == "true" ]]; then
     ts_dir="${ts_dir}_adv-entropy-pos${sentencepo_adv_entropy_alpha_pos}-neg${sentencepo_adv_entropy_alpha_neg}-norm${sentencepo_adv_entropy_norm}"
 fi
@@ -120,6 +127,9 @@ if [[ "$sentence_adv_enable" == "true" ]]; then
 fi
 if [[ "$sentence_judge_enable" == "true" ]]; then
     ts_dir="${ts_dir}_sja-alpha${sentence_judge_alpha}"
+fi
+if [[ "$judge_sft_enable" == "true" ]]; then
+    ts_dir="${ts_dir}_jsft-lambda${judge_sft_lambda}"
 fi
 export TENSORBOARD_DIR="${ts_dir}"
 mkdir -p ${TENSORBOARD_DIR}
@@ -215,6 +225,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
 	algorithm.sentence_judge_adv.debug_prompt=$sentence_judge_debug_prompt \
 	algorithm.sentence_judge_adv.every_n_steps=$sentence_judge_every_n_steps \
 	+algorithm.sentence_judge_adv.truncate_prompt=$sentence_judge_truncate_prompt \
+	+algorithm.judge_sft.enable=$judge_sft_enable \
+	+algorithm.judge_sft.data_path="$judge_sft_data_path" \
+	+algorithm.judge_sft.lambda_weight=$judge_sft_lambda \
+	+algorithm.judge_sft.micro_batch_size=$judge_sft_micro_batch_size \
+	+algorithm.judge_sft.max_seq_len=$judge_sft_max_seq_len \
 	+actor_rollout_ref.actor.policy_loss.analysis_bins.response_len_bins=$analysis_response_len_bins \
 	+actor_rollout_ref.actor.policy_loss.analysis_bins.sentence_count_bins=$analysis_sentence_count_bins \
 	+actor_rollout_ref.actor.policy_loss.analysis_bins.max_sentence_len_bins=$analysis_max_sentence_len_bins \

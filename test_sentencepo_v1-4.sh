@@ -101,6 +101,20 @@ sentence_judge_debug_prompt=${sentence_judge_debug_prompt:-false}
 sentence_judge_every_n_steps=${sentence_judge_every_n_steps:-1}
 sentence_judge_truncate_prompt=${sentence_judge_truncate_prompt:-true}
 
+# Auto-fill callable judge entry to avoid empty/null config errors.
+if [[ "$sentence_judge_backend" == "callable" ]]; then
+    if [[ -z "${sentence_judge_fn:-}" || "$sentence_judge_fn" == "null" ]]; then
+        sentence_judge_fn="verl.utils.judge_self:judge_fn"
+    fi
+fi
+
+
+# Judge SFT 混合损失（在 RL 训练中持续进化打分能力）
+judge_sft_enable=${judge_sft_enable:-false}
+judge_sft_data_path=${judge_sft_data_path:-""}  # 蒸馏后的 parquet 文件路径
+judge_sft_lambda=${judge_sft_lambda:-0.1}
+judge_sft_micro_batch_size=${judge_sft_micro_batch_size:-2}
+judge_sft_max_seq_len=${judge_sft_max_seq_len:-2048}
 
 # 诊断与可视化开关
 enable_sentence_analysis=${enable_sentence_analysis:-false}
@@ -124,7 +138,10 @@ fi
 if [[ "$sentence_judge_enable" == "true" ]]; then
     EX_NAME="${EX_NAME}_sja-alpha${sentence_judge_alpha}"
 fi
-TOT_DIR=$HOME/autodl-tmp/models_v1-4-metrics-2/${EX_NAME}
+if [[ "$judge_sft_enable" == "true" ]]; then
+    EX_NAME="${EX_NAME}_jsft-lambda${judge_sft_lambda}"
+fi
+TOT_DIR=$HOME/autodl-tmp/models_v1-4-metrics-sft/${EX_NAME}
 mkdir -p $TOT_DIR
 mkdir -p $TOT_DIR/verl_checkpoints_sentencepo
 
@@ -132,15 +149,18 @@ sentence_analysis_dir=${sentence_analysis_dir:-"$TOT_DIR/sentence_analysis"}
 # 是否开启 rollout 数据 dump 以便后续分析
 enable_rollout_data_dump=${enable_rollout_data_dump:-true}
 rollout_data_dir=${rollout_data_dir:-"$TOT_DIR/rollout_debug"}
+rollout_dump_sentence_texts=${rollout_dump_sentence_texts:-true} # dump 分句文本
+rollout_dump_max_sentences=${rollout_dump_max_sentences:-0}
+rollout_dump_max_chars=${rollout_dump_max_chars:-0}
 rollout_data_dir_arg=""
 if [[ "$enable_rollout_data_dump" == "true" ]]; then
     mkdir -p "$rollout_data_dir"
     rollout_data_dir_arg="trainer.rollout_data_dir=$rollout_data_dir"
 fi
 
-cd $HOME/sentencepo_v1-4-metrics
+cd $HOME/sentencepo_v1-4-metrics-sft
 
-PYTHONPATH=$HOME/sentencepo_v1-4-metrics \
+PYTHONPATH=$HOME/sentencepo_v1-4-metrics-sft \
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
@@ -220,6 +240,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.sentence_judge_adv.debug_prompt=$sentence_judge_debug_prompt \
     algorithm.sentence_judge_adv.every_n_steps=$sentence_judge_every_n_steps \
     +algorithm.sentence_judge_adv.truncate_prompt=$sentence_judge_truncate_prompt \
+    +algorithm.judge_sft.enable=$judge_sft_enable \
+    +algorithm.judge_sft.data_path="$judge_sft_data_path" \
+    +algorithm.judge_sft.lambda_weight=$judge_sft_lambda \
+    +algorithm.judge_sft.micro_batch_size=$judge_sft_micro_batch_size \
+    +algorithm.judge_sft.max_seq_len=$judge_sft_max_seq_len \
     +actor_rollout_ref.actor.policy_loss.analysis_bins.response_len_bins=$analysis_response_len_bins \
     +actor_rollout_ref.actor.policy_loss.analysis_bins.sentence_count_bins=$analysis_sentence_count_bins \
     +actor_rollout_ref.actor.policy_loss.analysis_bins.max_sentence_len_bins=$analysis_max_sentence_len_bins \
@@ -241,6 +266,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir=$TOT_DIR/verl_checkpoints_sentencepo \
     trainer.use_legacy_worker_impl=disable \
     $rollout_data_dir_arg \
+    +trainer.rollout_dump_sentence_texts=$rollout_dump_sentence_texts \
+    +trainer.rollout_dump_max_sentences=$rollout_dump_max_sentences \
+    +trainer.rollout_dump_max_chars=$rollout_dump_max_chars \
     +trainer.response_len_bins=$response_len_bins \
     +trainer.prompt_len_bins=$prompt_len_bins \
     +trainer.sentence_analysis.enable=$enable_sentence_analysis \

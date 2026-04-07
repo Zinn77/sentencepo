@@ -164,82 +164,16 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-PUNCTUATION_CHARS = {".", "?", "!", "。", "？", "！"}
-
-
 def build_sentence_ids_from_responses(
     tokenizer,
     responses: torch.Tensor,
     response_mask: torch.Tensor,
     min_sent_tokens: int = 6,
 ) -> torch.Tensor:
-    """Generate sentence ids for response tokens based on punctuation heuristics.
+    """Generate sentence ids for response tokens using shared splitting logic."""
+    from verl.utils.sentence_utils import build_sentence_ids_batch
 
-    Args:
-        tokenizer: HF tokenizer for decoding individual tokens.
-        responses: Tensor of shape (bsz, response_len) containing token ids.
-        response_mask: Tensor of same shape indicating valid response tokens (1 for valid, 0 otherwise).
-
-    Returns:
-        torch.LongTensor with same shape as ``responses`` assigning non-negative
-        sentence ids to valid tokens and ``-1`` elsewhere.
-    """
-
-    assert responses.shape == response_mask.shape
-
-    batch_size, seq_len = responses.shape
-    sentence_ids = torch.full_like(responses, fill_value=-1, dtype=torch.long)
-
-    min_sent_tokens = max(1, int(min_sent_tokens))
-
-    for b in range(batch_size):
-        valid_positions = (response_mask[b] > 0).nonzero(as_tuple=False).squeeze(-1)
-        if valid_positions.numel() == 0:
-            continue
-
-        sentences: list[list[int]] = []
-        current: list[int] = []
-        for idx in valid_positions.tolist():
-            token_id = int(responses[b, idx].item())
-            token_str = tokenizer.decode([token_id], skip_special_tokens=False)
-            current.append(idx)
-
-            if "\n" in token_str or any(ch in token_str for ch in PUNCTUATION_CHARS):
-                sentences.append(current)
-                current = []
-
-        if current:
-            sentences.append(current)
-
-        if not sentences:
-            continue
-
-        # Merge short sentences (< min_sent_tokens). Prefer merging into next; if last, merge into previous.
-        i = 0
-        while i < len(sentences):
-            if len(sentences[i]) < min_sent_tokens and len(sentences) > 1:
-                if i < len(sentences) - 1:
-                    sentences[i + 1] = sentences[i] + sentences[i + 1]
-                    sentences.pop(i)
-                    continue
-                else:
-                    sentences[i - 1] = sentences[i - 1] + sentences[i]
-                    sentences.pop(i)
-                    i = max(i - 1, 0)
-                    continue
-            i += 1
-
-        for sid, sent in enumerate(sentences):
-            for idx in sent:
-                sentence_ids[b, idx] = sid
-
-    # Offset ids per sample to avoid cross-sample mixing when flattened
-    for b in range(batch_size):
-        mask = sentence_ids[b] >= 0
-        if mask.any():
-            sentence_ids[b, mask] += b * (seq_len + 1)
-
-    return sentence_ids
+    return build_sentence_ids_batch(tokenizer, responses, response_mask, min_sent_tokens)
 
 
 def compute_response_mask(data: DataProto):
@@ -677,7 +611,7 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
-    def _generate_self_judge_outputs(self, batch: DataProto, sentence_judge_cfg) -> dict[str, list[str]] | None:
+    def _generate_self_judge_outputs(self, batch: DataProto, sentence_judge_cfg) -> dict[str, list[Any]] | None:
         sentence_ids = batch.batch.get("sentence_ids")
         response_mask = batch.batch.get("response_mask")
         responses = batch.batch.get("responses")
@@ -872,6 +806,7 @@ class RayPPOTrainer:
         return {
             "judge_outputs": outputs,
             "judge_prompts": rendered_prompts,
+            "sentence_texts": sentence_texts_list,
         }
 
     def _build_sentence_analysis_records(
@@ -1207,6 +1142,12 @@ class RayPPOTrainer:
                 reward_extra_infos_to_dump["self_judge_output"] = batch.non_tensor_batch["judge_outputs"].tolist()
             if "judge_prompts" in batch.non_tensor_batch:
                 reward_extra_infos_to_dump["self_judge_prompt"] = batch.non_tensor_batch["judge_prompts"].tolist()
+
+            dump_sentence_texts = bool(self.config.trainer.get("rollout_dump_sentence_texts", False))
+            if dump_sentence_texts:
+                if "output_sentences" in batch.non_tensor_batch:
+                    reward_extra_infos_to_dump["output_sentences"] = batch.non_tensor_batch["output_sentences"].tolist()
+
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_dict.setdefault(
                     "request_id",
@@ -2105,6 +2046,9 @@ class RayPPOTrainer:
                                         )
                                         batch.non_tensor_batch["judge_prompts"] = np.array(
                                             judge_result["judge_prompts"], dtype=object
+                                        )
+                                        batch.non_tensor_batch["output_sentences"] = np.array(
+                                            judge_result["sentence_texts"], dtype=object
                                         )
 
                         # Compute rollout importance sampling weights centrally (once per batch)

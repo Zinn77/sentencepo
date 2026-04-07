@@ -797,6 +797,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
 
+            # Initialize judge SFT mixed loss if enabled in algorithm config
+            judge_sft_cfg = getattr(getattr(self.config, "algorithm", None), "judge_sft", None)
+            if judge_sft_cfg is not None and getattr(judge_sft_cfg, "enable", False):
+                data_path = getattr(judge_sft_cfg, "data_path", "")
+                if data_path:
+                    self.actor.init_judge_sft(
+                        tokenizer=self.tokenizer,
+                        data_path=data_path,
+                        lambda_weight=float(getattr(judge_sft_cfg, "lambda_weight", 0.1)),
+                        micro_batch_size=int(getattr(judge_sft_cfg, "micro_batch_size", 2)),
+                        max_seq_len=int(getattr(judge_sft_cfg, "max_seq_len", 2048)),
+                    )
+
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 

@@ -20,6 +20,7 @@ from verl.base_config import BaseConfig
 __all__ = [
     "AlgoConfig",
     "FilterGroupsConfig",
+    "JudgeSFTConfig",
     "KLControlConfig",
     "SentenceAdvConfig",
     "SentenceJudgeAdvConfig",
@@ -129,6 +130,29 @@ class SentenceJudgeAdvConfig(BaseConfig):
 
 
 @dataclass
+class JudgeSFTConfig(BaseConfig):
+    """Configuration for judge SFT mixed loss during RL training.
+
+    When enabled, a cross-entropy SFT loss on pre-distilled judge data is added
+    to the policy loss: total_loss = policy_loss + lambda_weight * judge_sft_loss.
+    This allows the model's judge capability to evolve during RL training.
+
+    Args:
+        enable (bool): Enable judge SFT mixed loss.
+        data_path (str): Path to distilled judge SFT parquet (columns: prompt, response).
+        lambda_weight (float): Weight for judge SFT loss.
+        micro_batch_size (int): Micro-batch size for judge SFT samples per gradient step.
+        max_seq_len (int): Maximum sequence length for judge SFT samples.
+    """
+
+    enable: bool = False
+    data_path: str = ""
+    lambda_weight: float = 0.1
+    micro_batch_size: int = 2
+    max_seq_len: int = 2048
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -177,3 +201,4 @@ class AlgoConfig(BaseConfig):
     rollout_is: bool = False
     sentence_adv: Optional[SentenceAdvConfig] = None
     sentence_judge_adv: Optional[SentenceJudgeAdvConfig] = None
+    judge_sft: Optional[JudgeSFTConfig] = None

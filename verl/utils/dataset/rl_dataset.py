@@ -388,58 +388,10 @@ class RLHFDataset(Dataset):
         return row_dict
 
     def _build_sentence_ids(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Assign sentence ids based on punctuation and newline on valid tokens.
+        """Assign sentence ids using shared token-level splitting logic."""
+        from verl.utils.sentence_utils import build_sentence_ids_1d
 
-        Sentence boundaries are: English . ? !, Chinese 。 ？ ！, and newline \n.
-        Short sentences (< min_sent_tokens) are merged into the next sentence when possible.
-        """
-
-        sentence_ids = torch.full_like(input_ids, fill_value=-1)
-
-        valid_positions = attention_mask.nonzero(as_tuple=False).squeeze(-1)
-        if valid_positions.numel() == 0:
-            return sentence_ids
-
-        sentence_end_chars = {".", "?", "!", "。", "？", "！"}
-        min_sent_tokens = max(1, int(self.min_sent_tokens))
-
-        sentences: list[list[int]] = []
-        current: list[int] = []
-        for pos in valid_positions.tolist():
-            token_id = int(input_ids[pos].item())
-            token_str = self.tokenizer.decode([token_id], skip_special_tokens=False)
-
-            current.append(pos)
-            if "\n" in token_str or any(ch in token_str for ch in sentence_end_chars):
-                sentences.append(current)
-                current = []
-
-        if current:
-            sentences.append(current)
-
-        if not sentences:
-            return sentence_ids
-
-        # Merge short sentences (< min_sent_tokens). Prefer merging into next; if last, merge into previous.
-        i = 0
-        while i < len(sentences):
-            if len(sentences[i]) < min_sent_tokens and len(sentences) > 1:
-                if i < len(sentences) - 1:
-                    sentences[i + 1] = sentences[i] + sentences[i + 1]
-                    sentences.pop(i)
-                    continue
-                else:
-                    sentences[i - 1] = sentences[i - 1] + sentences[i]
-                    sentences.pop(i)
-                    i = max(i - 1, 0)
-                    continue
-            i += 1
-
-        for sid, sent in enumerate(sentences):
-            for pos in sent:
-                sentence_ids[pos] = sid
-
-        return sentence_ids
+        return build_sentence_ids_1d(self.tokenizer, input_ids, attention_mask, self.min_sent_tokens)
 
     def __getstate__(self):
         if not self.serialize_dataset:
