@@ -966,7 +966,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         pool_only = bool(data.meta_info.pop("sentence_adv_pool_only", False))
         if not return_hidden_states and hasattr(self.config, "algorithm"):
             sentence_adv_cfg = getattr(self.config.algorithm, "sentence_adv", None)
-            return_hidden_states = bool(getattr(sentence_adv_cfg, "enable", False))
+            slpa_cfg = getattr(self.config.algorithm, "slpa", None)
+            scr_cfg = getattr(self.config.algorithm, "scr", None)
+            return_hidden_states = (
+                bool(getattr(sentence_adv_cfg, "enable", False))
+                or bool(getattr(slpa_cfg, "enable", False))
+                or bool(getattr(scr_cfg, "enable", False))
+            )
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 output, entropys, hidden_states = self.actor.compute_log_prob(
@@ -976,9 +982,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if return_hidden_states and hidden_states is not None:
                 sentence_ids = data.batch.get("sentence_ids", None)
                 response_mask = data.batch.get("response_mask", None)
-                sentence_adv_cfg = getattr(getattr(self.config, "algorithm", None), "sentence_adv", None)
+                _algo = getattr(self.config, "algorithm", None)
+                sentence_adv_cfg = getattr(_algo, "sentence_adv", None)
+                slpa_cfg = getattr(_algo, "slpa", None)
+                scr_cfg = getattr(_algo, "scr", None)
+                # Resolve pooling mode: sentence_adv has explicit pooling;
+                # SLPA/SCR default to "last" when sentence_adv is absent.
                 pooling = getattr(sentence_adv_cfg, "pooling", None)
-                eps = float(getattr(sentence_adv_cfg, "eps", 1e-8))
+                if pooling is None and (
+                    bool(getattr(slpa_cfg, "enable", False))
+                    or bool(getattr(scr_cfg, "enable", False))
+                ):
+                    pooling = "last"
+                eps = float(getattr(sentence_adv_cfg, "eps", 1e-8)) if sentence_adv_cfg else 1e-8
 
                 def _pool_sentence_embeddings(
                     hs: torch.Tensor,

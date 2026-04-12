@@ -542,6 +542,303 @@ def compute_sentence_semantic_advantage(
     return sent_adv_tokens, metrics
 
 
+def compute_slpa_advantage(
+    sentence_embeddings: torch.Tensor | None,
+    sentence_unique_ids: torch.Tensor | None,
+    sentence_sample_idx: torch.Tensor | None,
+    sentence_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    token_level_rewards: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute Sentence-Level Process Advantage (SLPA).
+
+    Estimates a state-dependent baseline V_k at each sentence boundary via
+    kernel-weighted reward regression over group-internal rollouts, then
+    computes temporal differences Δ_k = V_k - V_{k-1} as sentence credit.
+
+    This generalises GRPO's constant baseline μ_group to a sentence-level
+    value function, reusing the N group rollouts as Monte Carlo samples
+    at zero additional inference cost.
+
+    Mathematical formulation:
+        K_emb(k, l) = exp(cosine(h_k, h_l) / τ_emb)
+        K_pos(k, l) = exp(-|pos_k - pos_l|² / (2σ²))
+        V_k(i)      = Σ_{j≠i} Σ_l [K_emb·K_pos · r_j] / Σ_{j≠i} Σ_l [K_emb·K_pos]
+        Δ_k(i)      = V_k(i) - V_{k-1}(i)   (V_{-1} = μ_group)
+
+    Returns:
+        slpa_advantages: (bs, seq_len) token-level process advantages.
+        metrics: diagnostic scalars.
+    """
+    metrics: dict[str, float] = {}
+    bs, seq_len = sentence_ids.shape
+    device = sentence_ids.device
+
+    slpa_cfg = getattr(config, "slpa", None)
+    if slpa_cfg is None or not getattr(slpa_cfg, "enable", False):
+        return torch.zeros((bs, seq_len), device=device), metrics
+
+    if sentence_embeddings is None or sentence_unique_ids is None or sentence_sample_idx is None:
+        return torch.zeros((bs, seq_len), device=device), metrics
+
+    tau_emb = float(getattr(slpa_cfg, "tau_emb", 0.1))
+    sigma_pos = float(getattr(slpa_cfg, "sigma_pos", 1.0))
+    do_normalize = bool(getattr(slpa_cfg, "normalize", True))
+    eps = float(getattr(slpa_cfg, "eps", 1e-8))
+    metrics_enable = bool(getattr(slpa_cfg, "metrics_enable", True))
+
+    sent_emb = F.normalize(sentence_embeddings.float().to(device), dim=-1)
+    unique_sid = sentence_unique_ids.to(device)
+    sent_sample = sentence_sample_idx.to(device)
+    num_sent = sent_emb.shape[0]
+    if num_sent == 0:
+        return torch.zeros((bs, seq_len), device=device), metrics
+
+    # Scalar rewards per sample
+    scores = token_level_rewards.to(device).sum(dim=-1)  # (bs,)
+    group_ids = as_torch_index(index, device=device)
+
+    # ---- Compute local sentence rank within each sample (vectorised) ----
+    sort_key = sent_sample.double() * (unique_sid.max().double() + 1) + unique_sid.double()
+    _, perm = torch.sort(sort_key)
+    sorted_sample = sent_sample[perm]
+
+    sent_count = torch.zeros(bs, device=device, dtype=torch.long)
+    sent_count.scatter_add_(0, sent_sample, torch.ones(num_sent, device=device, dtype=torch.long))
+
+    global_rank = torch.arange(num_sent, device=device, dtype=torch.long)
+    first_pos_sorted = torch.full((bs,), num_sent, device=device, dtype=torch.long)
+    first_pos_sorted.scatter_reduce_(0, sorted_sample, global_rank, reduce="amin", include_self=True)
+    local_rank_sorted = global_rank - first_pos_sorted[sorted_sample]
+
+    sent_local_idx = torch.zeros(num_sent, device=device, dtype=torch.long)
+    sent_local_idx[perm] = local_rank_sorted
+
+    # Relative position in [0, 1]
+    max_idx = (sent_count - 1).clamp(min=1)
+    sent_rel_pos = sent_local_idx.float() / max_idx[sent_sample].float()
+
+    # ---- Kernel-weighted V estimation per group ----
+    num_groups = int(group_ids.max().item()) + 1 if group_ids.numel() > 0 else 0
+    sent_group = group_ids[sent_sample]
+    V_estimates = torch.zeros(num_sent, device=device, dtype=torch.float)
+    delta = torch.zeros(num_sent, device=device, dtype=torch.float)
+
+    with torch.no_grad():
+        for g in range(num_groups):
+            g_sent_mask = sent_group == g
+            if not torch.any(g_sent_mask):
+                continue
+
+            g_sample_mask = group_ids == g
+            mu_group = scores[g_sample_mask].mean()
+
+            g_idx = torch.where(g_sent_mask)[0]
+            g_emb = sent_emb[g_idx]
+            g_sample_ids = sent_sample[g_idx]
+            g_rel_pos = sent_rel_pos[g_idx]
+            g_rewards = scores[g_sample_ids]
+            n_g = g_idx.shape[0]
+            if n_g < 2:
+                continue
+
+            # Embedding kernel: exp(cosine / τ)
+            cos_sim = g_emb @ g_emb.T
+            K_emb = torch.exp(cos_sim / tau_emb)
+
+            # Position kernel: exp(-Δpos² / 2σ²)
+            pos_diff = g_rel_pos.unsqueeze(1) - g_rel_pos.unsqueeze(0)
+            K_pos = torch.exp(-pos_diff.pow(2) / (2 * sigma_pos ** 2))
+
+            # Leave-one-out: mask sentences from the same rollout
+            same_rollout = g_sample_ids.unsqueeze(1) == g_sample_ids.unsqueeze(0)
+            K = K_emb * K_pos * (~same_rollout).float()
+
+            # V_k(i) = Σ_j K[k,j]·r_j / Σ_j K[k,j]
+            weighted_r = K * g_rewards.unsqueeze(0)
+            denom = K.sum(dim=1).clamp(min=eps)
+            V_k = weighted_r.sum(dim=1) / denom
+            V_estimates[g_idx] = V_k
+
+            # ---- Temporal difference per rollout ----
+            g_local = sent_local_idx[g_idx]
+            for s in g_sample_ids.unique():
+                s_mask = g_sample_ids == s
+                s_src = g_idx[s_mask]
+                s_local = g_local[s_mask]
+                s_V = V_k[s_mask]
+
+                order = torch.argsort(s_local)
+                V_sorted = s_V[order]
+                V_prev = torch.cat([mu_group.unsqueeze(0), V_sorted[:-1]])
+                d = V_sorted - V_prev
+
+                inv_order = torch.argsort(order)
+                delta[s_src] = d[inv_order]
+
+        # ---- Optional z-score normalisation within group ----
+        if do_normalize:
+            for g in range(num_groups):
+                g_mask = sent_group == g
+                if not torch.any(g_mask):
+                    continue
+                g_d = delta[g_mask]
+                if g_d.numel() > 1:
+                    delta[g_mask] = (g_d - g_d.mean()) / (g_d.std(unbiased=False) + eps)
+
+    # ---- Map to token level ----
+    valid = (response_mask > 0) & (sentence_ids >= 0)
+    flat_valid = valid.view(-1)
+    flat_sid = sentence_ids.view(-1)[flat_valid]
+    inv = torch.searchsorted(unique_sid, flat_sid)
+
+    flat_adv = torch.zeros(bs * seq_len, device=device, dtype=torch.float)
+    flat_adv[flat_valid] = delta[inv]
+    slpa_adv = flat_adv.view(bs, seq_len) * response_mask
+
+    if metrics_enable:
+        metrics["slpa/V_mean"] = float(V_estimates.mean().item())
+        metrics["slpa/V_std"] = float(V_estimates.std(unbiased=False).item()) if num_sent > 1 else 0.0
+        metrics["slpa/delta_mean"] = float(delta.mean().item())
+        metrics["slpa/delta_std"] = float(delta.std(unbiased=False).item()) if num_sent > 1 else 0.0
+        metrics["slpa/delta_abs_mean"] = float(delta.abs().mean().item())
+        metrics["slpa/num_sentences"] = float(num_sent)
+        metrics["slpa/num_groups"] = float(num_groups)
+
+    return slpa_adv, metrics
+
+
+def compute_scr_advantage(
+    sentence_embeddings: torch.Tensor | None,
+    sentence_unique_ids: torch.Tensor | None,
+    sentence_sample_idx: torch.Tensor | None,
+    sentence_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    token_level_rewards: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute Sentence Contrastive Reward (SCR).
+
+    Builds soft reward-weighted embedding centres with leave-one-out,
+    then scores each sentence by contrastive affinity:
+        w_j^+ = softmax(r_j / τ_r),  w_j^- = softmax(-r_j / τ_r)
+        C^+(i) = Σ_{j≠i} w_j^+ · ē_j,  C^-(i) = Σ_{j≠i} w_j^- · ē_j
+        SCR_k  = cos(h_k, C^+) / τ_s - cos(h_k, C^-) / τ_s
+
+    Unlike binary correct/incorrect centres, SCR uses reward-proportional
+    softmax weights, producing a smooth discriminative signal.
+
+    Returns:
+        scr_advantages: (bs, seq_len) token-level contrastive scores.
+        metrics: diagnostic scalars.
+    """
+    metrics: dict[str, float] = {}
+    bs, seq_len = sentence_ids.shape
+    device = sentence_ids.device
+
+    scr_cfg = getattr(config, "scr", None)
+    if scr_cfg is None or not getattr(scr_cfg, "enable", False):
+        return torch.zeros((bs, seq_len), device=device), metrics
+
+    if sentence_embeddings is None or sentence_unique_ids is None or sentence_sample_idx is None:
+        return torch.zeros((bs, seq_len), device=device), metrics
+
+    tau_reward = float(getattr(scr_cfg, "tau_reward", 1.0))
+    tau_sim = float(getattr(scr_cfg, "tau_sim", 0.1))
+    do_normalize = bool(getattr(scr_cfg, "normalize", True))
+    eps = float(getattr(scr_cfg, "eps", 1e-8))
+    metrics_enable = bool(getattr(scr_cfg, "metrics_enable", True))
+
+    sent_emb = F.normalize(sentence_embeddings.float().to(device), dim=-1)
+    unique_sid = sentence_unique_ids.to(device)
+    sent_sample = sentence_sample_idx.to(device)
+    num_sent = sent_emb.shape[0]
+    if num_sent == 0:
+        return torch.zeros((bs, seq_len), device=device), metrics
+
+    scores = token_level_rewards.to(device).sum(dim=-1)  # (bs,)
+    group_ids = as_torch_index(index, device=device)
+
+    # Per-rollout mean embedding
+    hidden_dim = sent_emb.shape[1]
+    rollout_emb_sum = torch.zeros((bs, hidden_dim), device=device, dtype=torch.float)
+    rollout_emb_sum.index_add_(0, sent_sample, sent_emb)
+    sent_count = torch.zeros(bs, device=device, dtype=torch.long)
+    sent_count.scatter_add_(0, sent_sample, torch.ones(num_sent, device=device, dtype=torch.long))
+    rollout_emb = F.normalize(rollout_emb_sum / sent_count.unsqueeze(1).clamp(min=1).float(), dim=-1)
+
+    num_groups = int(group_ids.max().item()) + 1 if group_ids.numel() > 0 else 0
+    sent_group = group_ids[sent_sample]
+    scr_scores = torch.zeros(num_sent, device=device, dtype=torch.float)
+
+    with torch.no_grad():
+        for g in range(num_groups):
+            g_sample_mask = group_ids == g
+            if not torch.any(g_sample_mask):
+                continue
+
+            g_sample_idx = torch.where(g_sample_mask)[0]
+            n_rollouts = g_sample_idx.shape[0]
+            if n_rollouts < 2:
+                continue
+
+            g_rewards = scores[g_sample_idx]           # (n_rollouts,)
+            g_rollout_emb = rollout_emb[g_sample_idx]  # (n_rollouts, hidden)
+
+            # Leave-one-out weighted centres for each rollout
+            for ri in range(n_rollouts):
+                sample_i = g_sample_idx[ri]
+                loo_mask = torch.ones(n_rollouts, device=device, dtype=torch.bool)
+                loo_mask[ri] = False
+                loo_r = g_rewards[loo_mask]
+                loo_e = g_rollout_emb[loo_mask]
+
+                w_pos = torch.softmax(loo_r / tau_reward, dim=0)
+                w_neg = torch.softmax(-loo_r / tau_reward, dim=0)
+
+                C_pos = F.normalize((w_pos.unsqueeze(1) * loo_e).sum(dim=0), dim=-1)
+                C_neg = F.normalize((w_neg.unsqueeze(1) * loo_e).sum(dim=0), dim=-1)
+
+                sent_mask_i = sent_sample == sample_i
+                if not torch.any(sent_mask_i):
+                    continue
+                h_i = sent_emb[sent_mask_i]
+
+                sim_pos = (h_i * C_pos).sum(dim=-1) / tau_sim
+                sim_neg = (h_i * C_neg).sum(dim=-1) / tau_sim
+                scr_scores[sent_mask_i] = sim_pos - sim_neg
+
+        # z-score within group
+        if do_normalize:
+            for g in range(num_groups):
+                g_mask = sent_group == g
+                if not torch.any(g_mask):
+                    continue
+                g_s = scr_scores[g_mask]
+                if g_s.numel() > 1:
+                    scr_scores[g_mask] = (g_s - g_s.mean()) / (g_s.std(unbiased=False) + eps)
+
+    # Map to token level
+    valid = (response_mask > 0) & (sentence_ids >= 0)
+    flat_valid = valid.view(-1)
+    flat_sid = sentence_ids.view(-1)[flat_valid]
+    inv = torch.searchsorted(unique_sid, flat_sid)
+
+    flat_adv = torch.zeros(bs * seq_len, device=device, dtype=torch.float)
+    flat_adv[flat_valid] = scr_scores[inv]
+    scr_adv = flat_adv.view(bs, seq_len) * response_mask
+
+    if metrics_enable:
+        metrics["scr/score_mean"] = float(scr_scores.mean().item())
+        metrics["scr/score_std"] = float(scr_scores.std(unbiased=False).item()) if num_sent > 1 else 0.0
+        metrics["scr/num_sentences"] = float(num_sent)
+
+    return scr_adv, metrics
+
+
 @register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")
 def compute_gae_advantage_return(
     token_level_rewards: torch.Tensor,

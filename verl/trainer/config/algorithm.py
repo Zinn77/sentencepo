@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "SentenceAdvConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "SentenceAdvConfig", "SLPAConfig", "SCRConfig"]
 
 
 @dataclass
@@ -84,6 +84,67 @@ class SentenceAdvConfig(BaseConfig):
 
 
 @dataclass
+class SLPAConfig(BaseConfig):
+    """Configuration for Sentence-Level Process Advantage (SLPA).
+
+    Estimates V_k at each sentence boundary via kernel-weighted reward
+    regression over group-internal rollouts, then computes temporal
+    differences Δ_k = V_k - V_{k-1} as sentence-level credit.
+
+    Args:
+        enable (bool): Enable SLPA.
+        alpha_correct (float): Fusion weight for correct rollouts.
+        alpha_incorrect (float): Fusion weight for incorrect rollouts.
+        tau_emb (float): Temperature for embedding cosine kernel.
+        sigma_pos (float): Bandwidth for position Gaussian kernel.
+        normalize (bool): Z-score normalize Δ within group.
+        eps (float): Numerical stability epsilon.
+        correctness_threshold (float): Threshold on sequence reward to define correctness.
+        metrics_enable (bool): Whether to emit SLPA diagnostics.
+    """
+
+    enable: bool = False
+    alpha_correct: float = 0.1
+    alpha_incorrect: float = 0.1
+    tau_emb: float = 0.1
+    sigma_pos: float = 1.0
+    normalize: bool = True
+    eps: float = 1e-8
+    correctness_threshold: float = 0.0
+    metrics_enable: bool = True
+
+
+@dataclass
+class SCRConfig(BaseConfig):
+    """Configuration for Sentence Contrastive Reward (SCR).
+
+    Uses soft reward-weighted embedding centers with leave-one-out
+    to compute per-sentence contrastive affinity scores.
+
+    Args:
+        enable (bool): Enable SCR.
+        alpha_correct (float): Fusion weight for correct rollouts.
+        alpha_incorrect (float): Fusion weight for incorrect rollouts.
+        tau_reward (float): Temperature for reward softmax weighting.
+        tau_sim (float): Temperature for cosine similarity scaling.
+        normalize (bool): Z-score normalize SCR within group.
+        eps (float): Numerical stability epsilon.
+        correctness_threshold (float): Threshold on sequence reward to define correctness.
+        metrics_enable (bool): Whether to emit SCR diagnostics.
+    """
+
+    enable: bool = False
+    alpha_correct: float = 0.05
+    alpha_incorrect: float = 0.05
+    tau_reward: float = 1.0
+    tau_sim: float = 0.1
+    normalize: bool = True
+    eps: float = 1e-8
+    correctness_threshold: float = 0.0
+    metrics_enable: bool = True
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -131,3 +192,5 @@ class AlgoConfig(BaseConfig):
     # True = apply weights to loss, False = compute metrics only (no weight application)
     rollout_is: bool = False
     sentence_adv: Optional[SentenceAdvConfig] = None
+    slpa: Optional[SLPAConfig] = None
+    scr: Optional[SCRConfig] = None

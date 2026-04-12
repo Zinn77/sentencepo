@@ -341,44 +341,98 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
 
+    # ---- Sentence-level advantage modules (bucket/compare, SLPA, SCR) ----
+    # Shared tensors used by all embedding-based modules
+    _sentence_ids = data.batch.get("sentence_ids")
+    _response_mask = data.batch.get("response_mask")
+    _index = data.non_tensor_batch.get("uid") if data.non_tensor_batch is not None else None
+    _has_sent_data = _sentence_ids is not None and _response_mask is not None and _index is not None
+
+    # (a) Bucket/compare sentence advantage (v1-3 legacy)
     sentence_adv_cfg = getattr(config, "sentence_adv", None) if config is not None else None
-    if sentence_adv_cfg is not None and getattr(sentence_adv_cfg, "enable", False):
-        sentence_ids = data.batch.get("sentence_ids")
-        response_mask = data.batch.get("response_mask")
-        index = data.non_tensor_batch.get("uid") if data.non_tensor_batch is not None else None
-        if sentence_ids is not None and response_mask is not None and index is not None:
-            token_hidden_states = data.batch["token_hidden_states"] if "token_hidden_states" in data.batch else None
-            sentence_embeddings = (
-                data.batch["sentence_embeddings"] if "sentence_embeddings" in data.batch else None
-            )
-            sentence_unique_ids = (
-                data.batch["sentence_unique_ids"] if "sentence_unique_ids" in data.batch else None
-            )
-            sentence_sample_idx = (
-                data.batch["sentence_sample_idx"] if "sentence_sample_idx" in data.batch else None
-            )
-            sentence_adv, sentence_adv_metrics = core_algos.compute_sentence_semantic_advantage(
-                token_hidden_states=token_hidden_states,
-                sentence_ids=sentence_ids,
-                response_mask=response_mask,
-                index=index,
-                token_level_rewards=data.batch["token_level_rewards"],
-                config=config,
-                sentence_embeddings=sentence_embeddings,
-                sentence_unique_ids=sentence_unique_ids,
-                sentence_sample_idx=sentence_sample_idx,
-            )
-            alpha = float(getattr(sentence_adv_cfg, "alpha", 0.1))
-            data.batch["advantages"] = data.batch["advantages"] + alpha * sentence_adv
-            data.batch["returns"] = data.batch["returns"] + alpha * sentence_adv
-            if sentence_adv_metrics:
-                if data.meta_info is None:
-                    data.meta_info = {}
-                data.meta_info["sentence_adv_metrics"] = sentence_adv_metrics
-        data.batch.pop("token_hidden_states", None)
-        data.batch.pop("sentence_embeddings", None)
-        data.batch.pop("sentence_unique_ids", None)
-        data.batch.pop("sentence_sample_idx", None)
+    if sentence_adv_cfg is not None and getattr(sentence_adv_cfg, "enable", False) and _has_sent_data:
+        token_hidden_states = data.batch.get("token_hidden_states")
+        sentence_embeddings = data.batch.get("sentence_embeddings")
+        sentence_unique_ids = data.batch.get("sentence_unique_ids")
+        sentence_sample_idx = data.batch.get("sentence_sample_idx")
+        sentence_adv, sentence_adv_metrics = core_algos.compute_sentence_semantic_advantage(
+            token_hidden_states=token_hidden_states,
+            sentence_ids=_sentence_ids,
+            response_mask=_response_mask,
+            index=_index,
+            token_level_rewards=data.batch["token_level_rewards"],
+            config=config,
+            sentence_embeddings=sentence_embeddings,
+            sentence_unique_ids=sentence_unique_ids,
+            sentence_sample_idx=sentence_sample_idx,
+        )
+        alpha = float(getattr(sentence_adv_cfg, "alpha", 0.1))
+        data.batch["advantages"] = data.batch["advantages"] + alpha * sentence_adv
+        data.batch["returns"] = data.batch["returns"] + alpha * sentence_adv
+        if sentence_adv_metrics:
+            if data.meta_info is None:
+                data.meta_info = {}
+            data.meta_info["sentence_adv_metrics"] = sentence_adv_metrics
+
+    # (b) SLPA: Sentence-Level Process Advantage
+    slpa_cfg = getattr(config, "slpa", None) if config is not None else None
+    if slpa_cfg is not None and getattr(slpa_cfg, "enable", False) and _has_sent_data:
+        slpa_adv, slpa_metrics = core_algos.compute_slpa_advantage(
+            sentence_embeddings=data.batch.get("sentence_embeddings"),
+            sentence_unique_ids=data.batch.get("sentence_unique_ids"),
+            sentence_sample_idx=data.batch.get("sentence_sample_idx"),
+            sentence_ids=_sentence_ids,
+            response_mask=_response_mask,
+            index=_index,
+            token_level_rewards=data.batch["token_level_rewards"],
+            config=config,
+        )
+        # Asymmetric fusion: different α for correct vs incorrect rollouts
+        _scores = data.batch["token_level_rewards"].sum(dim=-1)
+        _thresh = float(getattr(slpa_cfg, "correctness_threshold", 0.0))
+        _correct = _scores > _thresh
+        _ac = float(getattr(slpa_cfg, "alpha_correct", 0.1))
+        _ai = float(getattr(slpa_cfg, "alpha_incorrect", 0.1))
+        _alpha = torch.where(_correct, _ac, _ai).unsqueeze(-1)
+        data.batch["advantages"] = data.batch["advantages"] + _alpha * slpa_adv
+        data.batch["returns"] = data.batch["returns"] + _alpha * slpa_adv
+        if slpa_metrics:
+            if data.meta_info is None:
+                data.meta_info = {}
+            data.meta_info["slpa_metrics"] = slpa_metrics
+
+    # (c) SCR: Sentence Contrastive Reward
+    scr_cfg = getattr(config, "scr", None) if config is not None else None
+    if scr_cfg is not None and getattr(scr_cfg, "enable", False) and _has_sent_data:
+        scr_adv, scr_metrics = core_algos.compute_scr_advantage(
+            sentence_embeddings=data.batch.get("sentence_embeddings"),
+            sentence_unique_ids=data.batch.get("sentence_unique_ids"),
+            sentence_sample_idx=data.batch.get("sentence_sample_idx"),
+            sentence_ids=_sentence_ids,
+            response_mask=_response_mask,
+            index=_index,
+            token_level_rewards=data.batch["token_level_rewards"],
+            config=config,
+        )
+        _scores = data.batch["token_level_rewards"].sum(dim=-1)
+        _thresh = float(getattr(scr_cfg, "correctness_threshold", 0.0))
+        _correct = _scores > _thresh
+        _ac = float(getattr(scr_cfg, "alpha_correct", 0.05))
+        _ai = float(getattr(scr_cfg, "alpha_incorrect", 0.05))
+        _alpha = torch.where(_correct, _ac, _ai).unsqueeze(-1)
+        data.batch["advantages"] = data.batch["advantages"] + _alpha * scr_adv
+        data.batch["returns"] = data.batch["returns"] + _alpha * scr_adv
+        if scr_metrics:
+            if data.meta_info is None:
+                data.meta_info = {}
+            data.meta_info["scr_metrics"] = scr_metrics
+
+    # Cleanup temporary embedding tensors
+    data.batch.pop("token_hidden_states", None)
+    data.batch.pop("sentence_embeddings", None)
+    data.batch.pop("sentence_unique_ids", None)
+    data.batch.pop("sentence_sample_idx", None)
+
     policy_loss_cfg = None
     if config is not None and hasattr(config, "actor_rollout_ref") and hasattr(config.actor_rollout_ref, "actor"):
         policy_loss_cfg = getattr(config.actor_rollout_ref.actor, "policy_loss", None)
@@ -1728,7 +1782,14 @@ class RayPPOTrainer:
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         sentence_adv_cfg = getattr(self.config.algorithm, "sentence_adv", None)
-                        if sentence_adv_cfg is not None and getattr(sentence_adv_cfg, "enable", False):
+                        slpa_cfg = getattr(self.config.algorithm, "slpa", None)
+                        scr_cfg = getattr(self.config.algorithm, "scr", None)
+                        _need_sent_emb = (
+                            (sentence_adv_cfg is not None and getattr(sentence_adv_cfg, "enable", False))
+                            or (slpa_cfg is not None and getattr(slpa_cfg, "enable", False))
+                            or (scr_cfg is not None and getattr(scr_cfg, "enable", False))
+                        )
+                        if _need_sent_emb:
                             batch.meta_info["return_hidden_states"] = True
                             batch.meta_info["sentence_adv_pool_only"] = True
                             batch.meta_info["return_last_hidden_state_only"] = True
@@ -1824,6 +1885,12 @@ class RayPPOTrainer:
                         sentence_adv_metrics = batch.meta_info.pop("sentence_adv_metrics", None)
                         if sentence_adv_metrics:
                             metrics.update(sentence_adv_metrics)
+                        slpa_metrics = batch.meta_info.pop("slpa_metrics", None)
+                        if slpa_metrics:
+                            metrics.update(slpa_metrics)
+                        scr_metrics = batch.meta_info.pop("scr_metrics", None)
+                        if scr_metrics:
+                            metrics.update(scr_metrics)
 
                     # update critic
                     if self.use_critic:
