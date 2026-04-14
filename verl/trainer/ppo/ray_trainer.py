@@ -262,6 +262,64 @@ def compute_response_mask(data: DataProto):
     return response_mask
 
 
+def _pool_sentence_embeddings_from_tokens(
+    token_hidden_states: torch.Tensor,
+    sentence_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Pool token-level hidden states into sentence-level embeddings (last-token pooling).
+
+    Returns (sentence_embeddings, unique_sentence_ids, sentence_sample_idx) or None.
+    """
+    device = token_hidden_states.device
+    sentence_ids = sentence_ids.to(device)
+    response_mask = response_mask.to(device)
+    bs, seq_len, hidden = token_hidden_states.shape
+
+    valid = (response_mask > 0) & (sentence_ids >= 0)
+    if not torch.any(valid):
+        return None
+
+    flat_sid = sentence_ids.view(-1)
+    flat_valid = valid.view(-1)
+    flat_sid_valid = flat_sid[flat_valid]
+    if flat_sid_valid.numel() == 0:
+        return None
+
+    unique_sid, _ = torch.unique(flat_sid_valid, return_inverse=True)
+    num_sent = unique_sid.numel()
+    if num_sent == 0:
+        return None
+
+    # Find last token position per sentence
+    next_sid = torch.roll(sentence_ids, shifts=-1, dims=1)
+    next_valid = torch.roll(valid, shifts=-1, dims=1)
+    last_pos_mask = torch.zeros_like(valid)
+    last_pos_mask[:, -1] = True
+    boundary = last_pos_mask | (sentence_ids != next_sid) | (~next_valid)
+    last_mask = valid & boundary
+
+    flat_last = last_mask.view(-1)
+    flat_sid_last = flat_sid[flat_last]
+    if flat_sid_last.numel() == 0:
+        return None
+
+    idx_last = torch.searchsorted(unique_sid, flat_sid_last)
+
+    # Last-token pooling
+    flat_emb_last = token_hidden_states.view(-1, hidden)[flat_last]
+    sent_emb = torch.zeros((num_sent, hidden), device=device, dtype=token_hidden_states.dtype)
+    sent_emb.index_copy_(0, idx_last, flat_emb_last)
+
+    # Sample index per sentence
+    flat_sample_idx = torch.arange(bs, device=device).unsqueeze(1).expand(bs, seq_len).reshape(-1)
+    sent_sample_idx = torch.zeros((num_sent,), device=device, dtype=torch.long)
+    sent_sample_idx.index_copy_(0, idx_last, flat_sample_idx[flat_last])
+
+    return sent_emb, unique_sid, sent_sample_idx
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -374,13 +432,32 @@ def compute_advantage(
                 data.meta_info = {}
             data.meta_info["sentence_adv_metrics"] = sentence_adv_metrics
 
-    # (b) SLPA: Sentence-Level Process Advantage
+    # Pool token_hidden_states into sentence embeddings for SLPA/SCR
     slpa_cfg = getattr(config, "slpa", None) if config is not None else None
+    scr_cfg = getattr(config, "scr", None) if config is not None else None
+    _need_pool = (
+        _has_sent_data
+        and (
+            (slpa_cfg is not None and getattr(slpa_cfg, "enable", False))
+            or (scr_cfg is not None and getattr(scr_cfg, "enable", False))
+        )
+    )
+    _sent_emb = _sent_uid = _sent_sidx = None
+    if _need_pool and "token_hidden_states" in data.batch.keys():
+        _token_hs = data.batch["token_hidden_states"]
+        with torch.no_grad():
+            _pooled = _pool_sentence_embeddings_from_tokens(
+                _token_hs, _sentence_ids, _response_mask
+            )
+        if _pooled is not None:
+            _sent_emb, _sent_uid, _sent_sidx = _pooled
+
+    # (b) SLPA: Sentence-Level Process Advantage
     if slpa_cfg is not None and getattr(slpa_cfg, "enable", False) and _has_sent_data:
         slpa_adv, slpa_metrics = core_algos.compute_slpa_advantage(
-            sentence_embeddings=data.batch.get("sentence_embeddings"),
-            sentence_unique_ids=data.batch.get("sentence_unique_ids"),
-            sentence_sample_idx=data.batch.get("sentence_sample_idx"),
+            sentence_embeddings=_sent_emb,
+            sentence_unique_ids=_sent_uid,
+            sentence_sample_idx=_sent_sidx,
             sentence_ids=_sentence_ids,
             response_mask=_response_mask,
             index=_index,
@@ -402,12 +479,11 @@ def compute_advantage(
             data.meta_info["slpa_metrics"] = slpa_metrics
 
     # (c) SCR: Sentence Contrastive Reward
-    scr_cfg = getattr(config, "scr", None) if config is not None else None
     if scr_cfg is not None and getattr(scr_cfg, "enable", False) and _has_sent_data:
         scr_adv, scr_metrics = core_algos.compute_scr_advantage(
-            sentence_embeddings=data.batch.get("sentence_embeddings"),
-            sentence_unique_ids=data.batch.get("sentence_unique_ids"),
-            sentence_sample_idx=data.batch.get("sentence_sample_idx"),
+            sentence_embeddings=_sent_emb,
+            sentence_unique_ids=_sent_uid,
+            sentence_sample_idx=_sent_sidx,
             sentence_ids=_sentence_ids,
             response_mask=_response_mask,
             index=_index,

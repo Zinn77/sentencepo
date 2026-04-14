@@ -630,7 +630,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # For sync mode, we directly switch to trainer mode here.
         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
         if rollout_config.mode == "sync" and self._is_actor:
-            loop = asyncio.get_event_loop()
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
             loop.run_until_complete(self.trainer_mode())
 
     async def rollout_mode(self):
@@ -994,6 +999,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     or bool(getattr(scr_cfg, "enable", False))
                 ):
                     pooling = "last"
+                # Fallback: worker config is actor_rollout_ref (no algorithm section),
+                # so use pool_only flag set by ray_trainer when SLPA/SCR is enabled.
+                if pooling is None and pool_only:
+                    pooling = "last"
                 eps = float(getattr(sentence_adv_cfg, "eps", 1e-8)) if sentence_adv_cfg else 1e-8
 
                 def _pool_sentence_embeddings(
@@ -1058,18 +1067,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
                     return sent_emb, unique_sid, sent_sample_idx
 
-                if sentence_ids is not None and response_mask is not None and pooling in ("mean", "last"):
-                    with torch.no_grad():
-                        pooled = _pool_sentence_embeddings(hidden_states, sentence_ids, response_mask)
-                    if pooled is not None:
-                        sent_emb, unique_sid, sent_sample_idx = pooled
-                        tensors["sentence_embeddings"] = sent_emb
-                        tensors["sentence_unique_ids"] = unique_sid
-                        tensors["sentence_sample_idx"] = sent_sample_idx
-                    else:
-                        tensors["token_hidden_states"] = hidden_states
-                else:
-                    tensors["token_hidden_states"] = hidden_states
+                # Always store token_hidden_states (consistent batch dim with log_probs).
+                # Sentence-level pooling is done later in ray_trainer.compute_advantage().
+                tensors["token_hidden_states"] = hidden_states
             output = DataProto.from_dict(
                 tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
