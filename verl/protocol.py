@@ -960,9 +960,20 @@ class DataProto:
                         else:
                             merged_meta_info[k] = v
 
-            # Flatten list of dicts to dict of lists for consistent metrics structure
+            # Flatten list of dicts to dict of lists for consistent metrics structure.
+            # Use union of keys (tolerant merge) because different workers may produce
+            # different metric keys depending on data distribution (e.g. conditional
+            # bucket metrics in sentencepo).
             if all_metrics:
-                merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics)
+                all_keys: set[str] = set()
+                for d in all_metrics:
+                    all_keys.update(d.keys())
+                merged_metrics: dict[str, list] = {k: [] for k in all_keys}
+                for d in all_metrics:
+                    for k in all_keys:
+                        if k in d:
+                            merged_metrics[k].append(d[k])
+                merged_meta_info["metrics"] = merged_metrics
 
         cls = type(data[0]) if len(data) > 0 else DataProto
         return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)
