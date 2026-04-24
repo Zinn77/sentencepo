@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-set -x
+set -ex
+
+# 固定随机数种子
+SEED=${SEED:-42}
+export PYTHONHASHSEED=$SEED
 
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HOME=$HOME/autodl-tmp/huggingface
@@ -21,7 +25,7 @@ train_files="['$math_train_path']"
 # test_files="['$math_test_path']"
 test_files="['$math500_test_path', '$aime2024_test_path', '$aime2025_test_path', '$amc23_test_path', '$minerva_test_path', '$olympiad_train_path']"
 
-# 训练设置
+# 训练设置（与 v1-5 对齐）
 DS=${DS:-math}
 EPOCHS=${EPOCHS:-3}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B-Base}
@@ -34,7 +38,7 @@ max_num_batched_tokens=8192    # 默认 8192
 micro_batch_size=4
 
 # 诊断与可视化开关
-enable_sentence_analysis=${enable_sentence_analysis:-true}
+enable_sentence_analysis=${enable_sentence_analysis:-false}
 sentence_analysis_max_samples=${sentence_analysis_max_samples:-4096}
 sentence_analysis_top_k=${sentence_analysis_top_k:-3}
 sentence_analysis_group_by_uid=${sentence_analysis_group_by_uid:-true}
@@ -44,16 +48,19 @@ analysis_response_len_bins=${analysis_response_len_bins:-"[128,256,512,1024,2048
 analysis_sentence_count_bins=${analysis_sentence_count_bins:-"[4,8,16,32,64]"}
 analysis_max_sentence_len_bins=${analysis_max_sentence_len_bins:-"[32,64,128,256,512]"}
 
-TOT_DIR=$HOME/autodl-tmp/models_v1-1-metrics/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}
+# 结果路径
+TOT_DIR=$HOME/autodl-tmp/models_v1-5/grpo_${DS}_${MODEL_NAME}_ep${EPOCHS}_rand${SEED}
 mkdir -p $TOT_DIR
 mkdir -p $TOT_DIR/verl_checkpoints_grpo
 
 sentence_analysis_dir=${sentence_analysis_dir:-"$TOT_DIR/sentence_analysis"}
 
-cd $HOME/sentencepo_v1-1-metrics
+cd $HOME/sentencepo_v1-5
 
-PYTHONPATH=$HOME/sentencepo_v1-1-metrics \
+PYTHONPATH=$HOME/sentencepo_v1-5 \
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+    +data.seed=$SEED \
+    +critic.data_loader_seed=$SEED \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
@@ -74,8 +81,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$micro_batch_size \
@@ -86,7 +93,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$max_num_batched_tokens \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$micro_batch_size \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     +actor_rollout_ref.actor.policy_loss.analysis_bins.response_len_bins=$analysis_response_len_bins \
     +actor_rollout_ref.actor.policy_loss.analysis_bins.sentence_count_bins=$analysis_sentence_count_bins \
     +actor_rollout_ref.actor.policy_loss.analysis_bins.max_sentence_len_bins=$analysis_max_sentence_len_bins \

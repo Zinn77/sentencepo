@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-set -x
+set -ex
+
+# 固定随机数种子
+SEED=${SEED:-42}
+export PYTHONHASHSEED=$SEED
 
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HOME=$HOME/autodl-tmp/huggingface
@@ -42,7 +46,7 @@ sentencepo_lambda_len=0
 sentencepo_cmin=0.5
 sentencepo_cmax=1.5
 sentencepo_stats_eps=1e-6
-sentencepo_metrics_level=${sentencepo_metrics_level:-full} # 可选 full / basic / off，basic 模式下不记录分句相关指标
+sentencepo_metrics_level=${sentencepo_metrics_level:-off} # 可选 full / basic / off，basic 模式下不记录分句相关指标
 
 # v1-2 句子熵优势开关与参数
 sentencepo_adv_entropy_enable=${sentencepo_adv_entropy_enable:-false}
@@ -75,7 +79,7 @@ scr_correctness_threshold=${scr_correctness_threshold:-0.0}
 scr_metrics_enable=${scr_metrics_enable:-true}
 
 # 诊断与可视化开关
-enable_sentence_analysis=${enable_sentence_analysis:-true}
+enable_sentence_analysis=${enable_sentence_analysis:-false}
 sentence_analysis_max_samples=${sentence_analysis_max_samples:-4096}
 sentence_analysis_top_k=${sentence_analysis_top_k:-3}
 sentence_analysis_group_by_uid=${sentence_analysis_group_by_uid:-true}
@@ -86,16 +90,18 @@ analysis_sentence_count_bins=${analysis_sentence_count_bins:-"[4,8,16,32,64]"}
 analysis_max_sentence_len_bins=${analysis_max_sentence_len_bins:-"[32,64,128,256,512]"}
 
 # 结果路径
-TOT_DIR=$HOME/autodl-tmp/models_v1-5/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}_epsbase${sentencepo_eps_base}_slpa${slpa_enable}_scr${scr_enable}
+TOT_DIR=$HOME/autodl-tmp/models_v1-5/sentencepo_${DS}_${MODEL_NAME}_ep${EPOCHS}_epsbase${sentencepo_eps_base}_slpa${slpa_enable}_scr${scr_enable}_rand${SEED}
 mkdir -p $TOT_DIR
 mkdir -p $TOT_DIR/verl_checkpoints_sentencepo
 
 sentence_analysis_dir=${sentence_analysis_dir:-"$TOT_DIR/sentence_analysis"}
 
-cd $HOME/sentencepo_v1-5-combined
+cd $HOME/sentencepo_v1-5
 
-PYTHONPATH=$HOME/sentencepo_v1-5-combined \
+PYTHONPATH=$HOME/sentencepo_v1-5 \
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+	+data.seed=$SEED \
+	+critic.data_loader_seed=$SEED \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
