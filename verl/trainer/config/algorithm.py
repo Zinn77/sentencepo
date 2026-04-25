@@ -93,6 +93,7 @@ class SLPAConfig(BaseConfig):
 
     Args:
         enable (bool): Enable SLPA.
+        topk_sim_sentences (int): For each sentence, only use top-k most similar cross-rollout sentences.
         alpha_correct (float): Fusion weight for correct rollouts.
         alpha_incorrect (float): Fusion weight for incorrect rollouts.
         tau_emb (float): Temperature for embedding cosine kernel.
@@ -104,6 +105,7 @@ class SLPAConfig(BaseConfig):
     """
 
     enable: bool = False
+    topk_sim_sentences: int = 1
     alpha_correct: float = 0.1
     alpha_incorrect: float = 0.1
     tau_emb: float = 0.1

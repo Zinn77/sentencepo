@@ -105,7 +105,7 @@ K(k_i, l_j) = K_emb(h_k^(i), h_l^(j)) · K_pos(k, l)
 对于 rollout i 的第 k 个句子，通过核加权回归估计其"状态价值"：
 
 ```
-V_k(i) = Σ_{j≠i} Σ_l [ K(k_i, l_j) · r_j ] / Σ_{j≠i} Σ_l [ K(k_i, l_j) ]
+V_k(i) = Σ_{j≠i} argmax_l  [ K(k_i, l_j) · r_j  /  K(k_i, l_j) ]
 ```
 
 **关键设计**：

@@ -565,7 +565,8 @@ def compute_slpa_advantage(
     Mathematical formulation:
         K_emb(k, l) = exp(cosine(h_k, h_l) / τ_emb)
         K_pos(k, l) = exp(-|pos_k - pos_l|² / (2σ²))
-        V_k(i)      = Σ_{j≠i} Σ_l [K_emb·K_pos · r_j] / Σ_{j≠i} Σ_l [K_emb·K_pos]
+        V_k(i)      = Σ_{(j,l) in TopK_i} [K_emb·K_pos · r_j] / Σ_{(j,l) in TopK_i} [K_emb·K_pos]
+                      where TopK_i keeps top-k most similar cross-rollout sentences
         Δ_k(i)      = V_k(i) - V_{k-1}(i)   (V_{-1} = μ_group)
 
     Returns:
@@ -585,6 +586,7 @@ def compute_slpa_advantage(
 
     tau_emb = float(getattr(slpa_cfg, "tau_emb", 0.1))
     sigma_pos = float(getattr(slpa_cfg, "sigma_pos", 1.0))
+    topk_sim_sentences = max(1, int(getattr(slpa_cfg, "topk_sim_sentences", 1)))
     do_normalize = bool(getattr(slpa_cfg, "normalize", True))
     eps = float(getattr(slpa_cfg, "eps", 1e-8))
     metrics_enable = bool(getattr(slpa_cfg, "metrics_enable", True))
@@ -656,10 +658,20 @@ def compute_slpa_advantage(
             same_rollout = g_sample_ids.unsqueeze(1) == g_sample_ids.unsqueeze(0)
             K = K_emb * K_pos * (~same_rollout).float()
 
-            # V_k(i) = Σ_j K[k,j]·r_j / Σ_j K[k,j]
-            weighted_r = K * g_rewards.unsqueeze(0)
-            denom = K.sum(dim=1).clamp(min=eps)
-            V_k = weighted_r.sum(dim=1) / denom
+            # Keep only top-k most similar cross-rollout sentences for each query sentence.
+            # This changes V estimation from all-neighbor smoothing to local nearest-neighbor regression.
+            K_for_topk = K.masked_fill(K <= 0, float("-inf"))
+            max_k = int(min(topk_sim_sentences, K_for_topk.shape[1]))
+            if max_k <= 0:
+                continue
+            topk_vals, topk_idx = torch.topk(K_for_topk, k=max_k, dim=1)
+            valid_topk = torch.isfinite(topk_vals)
+            topk_weights = torch.where(valid_topk, topk_vals, torch.zeros_like(topk_vals))
+            topk_rewards = g_rewards[topk_idx]
+
+            weighted_r = (topk_weights * topk_rewards).sum(dim=1)
+            denom = topk_weights.sum(dim=1)
+            V_k = torch.where(denom > eps, weighted_r / denom.clamp(min=eps), mu_group)
             V_estimates[g_idx] = V_k
 
             # ---- Temporal difference per rollout ----
@@ -706,6 +718,7 @@ def compute_slpa_advantage(
         metrics["slpa/delta_abs_mean"] = float(delta.abs().mean().item())
         metrics["slpa/num_sentences"] = float(num_sent)
         metrics["slpa/num_groups"] = float(num_groups)
+        metrics["slpa/topk_sim_sentences"] = float(topk_sim_sentences)
 
     return slpa_adv, metrics
 
