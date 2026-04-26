@@ -1777,13 +1777,6 @@ def compute_policy_loss_sentencepo(
     lower = torch.exp(-c_sent)
     upper = torch.exp(c_sent)
 
-    # Sequence-level advantage broadcast to sentences
-    if advantages.dim() == 2:
-        seq_adv = verl_F.masked_mean(advantages, response_mask, axis=-1)
-    else:
-        seq_adv = advantages
-    seq_adv = seq_adv.to(log_prob.dtype)
-
     # Map each sentence to its batch id
     flat_indices = torch.nonzero(valid, as_tuple=False).squeeze(-1)
     flat_batch = (flat_indices // seq_len).to(torch.float32)
@@ -1791,7 +1784,24 @@ def compute_policy_loss_sentencepo(
     sent_batch_sum.index_add_(0, inv, flat_batch)
     sent_batch = (sent_batch_sum / cnt).round().long()
 
-    sent_adv = seq_adv[sent_batch]
+    # Sentence advantage: per-sentence or sequence-level
+    per_sentence_adv = bool(getattr(policy_cfg, "sentencepo_per_sentence_adv", False))
+    if per_sentence_adv and advantages.dim() == 2:
+        # Per-sentence advantage: extract each sentence's own advantage from token-level tensor.
+        # When SLPA/SCR is enabled, tokens within a sentence share the same advantage value
+        # (A_GRPO + α·Δ_k), so averaging over tokens in a sentence recovers that value.
+        flat_adv = advantages.view(-1)[valid].to(log_prob.dtype)
+        adv_sum = torch.zeros(num_sent, device=log_prob.device, dtype=log_prob.dtype)
+        adv_sum.index_add_(0, inv, flat_adv)
+        sent_adv = adv_sum / (cnt.to(log_prob.dtype) + 1e-8)
+    else:
+        # Original: sequence-level advantage broadcast to all sentences
+        if advantages.dim() == 2:
+            seq_adv = verl_F.masked_mean(advantages, response_mask, axis=-1)
+        else:
+            seq_adv = advantages
+        seq_adv = seq_adv.to(log_prob.dtype)
+        sent_adv = seq_adv[sent_batch]
 
     obj1 = rho_sent * sent_adv
     obj2 = torch.clamp(rho_sent, lower, upper) * sent_adv

@@ -79,6 +79,7 @@ class PolicyLossConfig(BaseConfig):
     sentencepo_adv_entropy_norm: str = "zscore"
     sentencepo_adv_entropy_clip: float = 2.0
     sentencepo_adv_entropy_eps: float = 1e-6
+    sentencepo_per_sentence_adv: bool = False
     analysis_bins: dict[str, Any] = field(default_factory=dict)
 
 

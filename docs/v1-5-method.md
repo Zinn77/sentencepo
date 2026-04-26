@@ -715,4 +715,108 @@ Title: "Sentence-Level Process Advantage for Group Relative Policy Optimization"
 - `slpa/V_std ≈ 0`：核函数太平滑，所有句子得到近似相同的 V_k → 尝试减小 τ_emb 或 σ_pos
 - `slpa/delta_abs_mean` 很大但训练不稳定：α 可能设太大 → 减小 alpha_correct/incorrect
 - `scr/score_std ≈ 0`：所有句子得到相似的对比分 → 检查 τ_reward 是否太大（导致 w+ ≈ w-）
+
+---
+
+## 10. 变更日志
+
+### 2026-04-20: 首轮实验诊断 + 代码修复 + 实验框架重构
+
+**背景**：首轮 5×3 seeds 实验（SLPA-only / SCR-only / SLPA+SCR / GRPO / GSPO）跑完，v1-5 三个变体在 6 个数据集上均未超过 GRPO baseline。进行了系统性诊断，发现 4 个问题并实施修复。
+
+#### 10.1 诊断的 4 个问题
+
+| ID | 严重度 | 问题 | 影响 |
+|----|--------|------|------|
+| A | Critical | sentencepo loss 中 `masked_mean(advantages, response_mask)` 将逐句 SLPA advantage 坍缩回序列级标量 | SLPA 的句子级信用分配在 loss 计算中完全失效 |
+| B | Fundamental | SLPA/SCR 信号依赖组内 reward 方差；随训练推进 reward→1.0，方差→0，信号自然消亡 | 训练后期 SLPA/SCR 贡献趋于零 |
+| C | High | sentencepo loss 的 `eps_base=0.01` 导致 clip 范围仅 ±1%，策略几乎无法更新 | sentencepo loss 模式下训练被严重约束 |
+| D | Medium | 训练后期 entropy 膨胀、response 变长 | A+B 的下游症状 |
+
+详细分析见 `docs/v1-5-experiment-analysis.md`。
+
+#### 10.2 代码改动
+
+**文件 1: `verl/trainer/ppo/core_algos.py` — 逐句 advantage 支持**
+
+在 `compute_policy_loss_sentencepo()` 中新增 `sentencepo_per_sentence_adv` 开关（**默认 false，不影响已有行为**）：
+- `false`（默认）：走原来的 `masked_mean` 路径，将 advantage 坍缩为序列级
+- `true`（新）：对每个句子，取该句子 token 对应的 advantage 均值作为 `sent_adv`
+
+核心逻辑：
+```python
+if per_sentence_adv and advantages.dim() == 2:
+    # 按句子聚合 token-level advantage → 真正的逐句 advantage
+    flat_adv = advantages.view(-1)[valid].to(log_prob.dtype)
+    adv_sum = torch.zeros(num_sent, ...)
+    adv_sum.index_add_(0, inv, flat_adv)
+    sent_adv = adv_sum / (cnt + 1e-8)
+else:
+    # 原路径：序列级 advantage 广播到所有句子
+    seq_adv = masked_mean(advantages, response_mask, axis=-1)
+    sent_adv = seq_adv[sent_batch]
+```
+
+**文件 2: `verl/trainer/config/algorithm.py` — 新增 decay 配置**
+
+`SLPAConfig` 和 `SCRConfig` 各新增两个字段：
+```python
+alpha_decay: str = "none"       # "none" | "linear"
+alpha_min_ratio: float = 0.1    # decay 下限（初始 alpha 的比例）
+```
+
+**文件 3: `verl/trainer/ppo/ray_trainer.py` — Alpha decay 实现**
+
+1. `compute_advantage()` 新增 `progress: float = 0.0` 参数
+2. SLPA/SCR 融合块中，读取 `alpha_decay` 配置，按训练进度线性衰减 alpha：
+```python
+if alpha_decay == "linear":
+    decay_factor = max(min_ratio, 1.0 - progress * (1.0 - min_ratio))
+    alpha_correct *= decay_factor
+    alpha_incorrect *= decay_factor
+```
+3. 调用处传入 `progress = global_steps / total_training_steps`
+
+**向后兼容性**：所有改动默认关闭（`per_sentence_adv=false`, `alpha_decay="none"`），不影响任何已有实验行为。
+
+#### 10.3 新增实验脚本
+
+| 脚本 | 用途 |
+|------|------|
+| `test_v1-5_experiment.sh` | 通用实验脚本，支持 `LOSS_MODE`（vanilla/sentencepo/gspo）+ 所有 SLPA/SCR/decay 参数 |
+| `run_v1-5_phase1.sh` | Phase 1: 无需代码改动的实验（vanilla loss + SLPA/SCR），验证信号有效性 |
+| `run_v1-5_phase2.sh` | Phase 2: 启用 `per_sentence_adv` + alpha decay + 放松 clip |
+
+#### 10.4 实验计划（修订版）
+
+**Phase 1**（不改代码，纯超参数）— 验证 SLPA/SCR 信号本身的有效性：
+
+| EXP | 配置 | 目的 |
+|-----|------|------|
+| 1 | vanilla loss + SLPA(α=0.05) | 最重要：用标准 PPO loss 测试 SLPA 信号 |
+| 2 | vanilla loss + SCR(α=0.03) | 单独测试 SCR |
+| 3 | vanilla loss + SLPA(0.03) + SCR(0.02) | 双通道组合 |
+| 4 | sentencepo loss + SLPA(0.03) + SCR(0.02) [小α] | 缩小 α 看是否缓解 |
+| 5 | sentencepo(eps=0.03) + SLPA(0.03) + SCR(0.02) | 放松 clip |
+
+**Phase 2**（需要代码改动）— 修复 Problem A + B：
+
+| EXP | 配置 | 目的 |
+|-----|------|------|
+| 1 | sentencepo + per_sent_adv + SLPA(0.05), eps=0.03 | 核心修复 |
+| 2 | sentencepo + per_sent_adv + SLPA(0.03) + SCR(0.02), eps=0.03 | 双通道 |
+| 3 | 同 1 + linear decay | 对抗信号坍缩 |
+| 4 | 同 2 + linear decay (both) | 完整方案 |
+| 5 | sentencepo + per_sent_adv + SLPA(0.1) + decay | 激进信号 |
+| 6 | sentencepo(eps=0.05) + per_sent_adv + SLPA(0.05) + decay | 更松 clip |
+
+#### 10.5 新增配置参数
+
+| 参数 | 默认值 | 位置 | 说明 |
+|------|--------|------|------|
+| `sentencepo_per_sentence_adv` | false | policy_loss config | 开启逐句 advantage（修复 Problem A） |
+| `slpa.alpha_decay` | "none" | SLPAConfig | "none" 或 "linear" |
+| `slpa.alpha_min_ratio` | 0.1 | SLPAConfig | linear decay 下限 |
+| `scr.alpha_decay` | "none" | SCRConfig | 同上 |
+| `scr.alpha_min_ratio` | 0.1 | SCRConfig | 同上 |
 - 训练 reward 下降：SLPA/SCR 信号可能与 GRPO 方向冲突 → 先减小 α 观察

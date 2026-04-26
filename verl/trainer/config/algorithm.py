@@ -101,6 +101,8 @@ class SLPAConfig(BaseConfig):
         eps (float): Numerical stability epsilon.
         correctness_threshold (float): Threshold on sequence reward to define correctness.
         metrics_enable (bool): Whether to emit SLPA diagnostics.
+        alpha_decay (str): Decay schedule for alpha ('none' or 'linear').
+        alpha_min_ratio (float): Minimum alpha as fraction of initial (for linear decay).
     """
 
     enable: bool = False
@@ -112,6 +114,8 @@ class SLPAConfig(BaseConfig):
     eps: float = 1e-8
     correctness_threshold: float = 0.0
     metrics_enable: bool = True
+    alpha_decay: str = "none"
+    alpha_min_ratio: float = 0.1
 
 
 @dataclass
@@ -131,6 +135,8 @@ class SCRConfig(BaseConfig):
         eps (float): Numerical stability epsilon.
         correctness_threshold (float): Threshold on sequence reward to define correctness.
         metrics_enable (bool): Whether to emit SCR diagnostics.
+        alpha_decay (str): Decay schedule for alpha ('none' or 'linear').
+        alpha_min_ratio (float): Minimum alpha as fraction of initial (for linear decay).
     """
 
     enable: bool = False
@@ -142,6 +148,8 @@ class SCRConfig(BaseConfig):
     eps: float = 1e-8
     correctness_threshold: float = 0.0
     metrics_enable: bool = True
+    alpha_decay: str = "none"
+    alpha_min_ratio: float = 0.1
 
 
 @dataclass

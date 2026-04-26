@@ -328,6 +328,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    progress: float = 0.0,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -470,6 +471,13 @@ def compute_advantage(
         _correct = _scores > _thresh
         _ac = float(getattr(slpa_cfg, "alpha_correct", 0.1))
         _ai = float(getattr(slpa_cfg, "alpha_incorrect", 0.1))
+        # Alpha decay: reduce contribution as training progresses
+        _decay_mode = str(getattr(slpa_cfg, "alpha_decay", "none"))
+        if _decay_mode == "linear":
+            _min_ratio = float(getattr(slpa_cfg, "alpha_min_ratio", 0.1))
+            _decay_factor = max(_min_ratio, 1.0 - progress * (1.0 - _min_ratio))
+            _ac *= _decay_factor
+            _ai *= _decay_factor
         _alpha = torch.where(_correct, _ac, _ai).unsqueeze(-1)
         data.batch["advantages"] = data.batch["advantages"] + _alpha * slpa_adv
         data.batch["returns"] = data.batch["returns"] + _alpha * slpa_adv
@@ -495,6 +503,13 @@ def compute_advantage(
         _correct = _scores > _thresh
         _ac = float(getattr(scr_cfg, "alpha_correct", 0.05))
         _ai = float(getattr(scr_cfg, "alpha_incorrect", 0.05))
+        # Alpha decay: reduce contribution as training progresses
+        _decay_mode = str(getattr(scr_cfg, "alpha_decay", "none"))
+        if _decay_mode == "linear":
+            _min_ratio = float(getattr(scr_cfg, "alpha_min_ratio", 0.1))
+            _decay_factor = max(_min_ratio, 1.0 - progress * (1.0 - _min_ratio))
+            _ac *= _decay_factor
+            _ai *= _decay_factor
         _alpha = torch.where(_correct, _ac, _ai).unsqueeze(-1)
         data.batch["advantages"] = data.batch["advantages"] + _alpha * scr_adv
         data.batch["returns"] = data.batch["returns"] + _alpha * scr_adv
@@ -1949,6 +1964,7 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
+                        _progress = self.global_steps / max(self.total_training_steps, 1)
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1957,6 +1973,7 @@ class RayPPOTrainer:
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
+                            progress=_progress,
                         )
                         sentence_adv_metrics = batch.meta_info.pop("sentence_adv_metrics", None)
                         if sentence_adv_metrics:

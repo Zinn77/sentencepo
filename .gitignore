@@ -134,4 +134,11 @@ models
 # flash_attn and flashinfer
 flash*
 
+test.py
+
 CLAUDE.md
+CCdocs/
+
+run_v1-5_phase1.sh
+run_v1-5_phase2.sh
+test_v1-5_smoke*
