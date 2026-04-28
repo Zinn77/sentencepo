@@ -1829,7 +1829,17 @@ class RayPPOTrainer:
                     enable_sentence_analysis = bool(sentence_analysis_cfg.get("enable", False))
                     sentence_adv_cfg = getattr(self.config.algorithm, "sentence_adv", None)
                     enable_sentence_adv = bool(getattr(sentence_adv_cfg, "enable", False))
-                    if loss_mode in {"sentencepo", "gspo"} or enable_sentence_analysis or enable_sentence_adv:
+                    slpa_cfg = getattr(self.config.algorithm, "slpa", None)
+                    scr_cfg = getattr(self.config.algorithm, "scr", None)
+                    enable_slpa = bool(getattr(slpa_cfg, "enable", False))
+                    enable_scr = bool(getattr(scr_cfg, "enable", False))
+                    if (
+                        loss_mode in {"sentencepo", "gspo"}
+                        or enable_sentence_analysis
+                        or enable_sentence_adv
+                        or enable_slpa
+                        or enable_scr
+                    ):
                         if hasattr(self.config, "data"):
                             min_sent_tokens = self.config.data.get(
                                 "min_sent_tokens", self.config.data.get("sentencepo_min_sent_tokens", 6)
