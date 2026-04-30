@@ -17,7 +17,30 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "SentenceAdvConfig", "SLPAConfig", "SCRConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "SentenceAdvConfig",
+    "SentenceReprConfig",
+    "SLPAConfig",
+    "SCRConfig",
+]
+
+
+@dataclass
+class SentenceReprConfig(BaseConfig):
+    """Sentence representation source for v1-5-hidden ablation.
+
+    Args:
+        hidden_layer_index: int (single layer) or list[int] (ensemble mean).
+            Negative indices are accepted (-1 = last layer).
+        pooling: One of {"last", "mean", "first", "mean_no_punct",
+            "entropy_weighted", "diff"}.
+    """
+
+    hidden_layer_index: Any = -1
+    pooling: str = "last"
 
 
 @dataclass
@@ -81,6 +104,7 @@ class SentenceAdvConfig(BaseConfig):
     correctness_threshold: float = 0.0
     bucket_count: int = 3
     metrics_enable: bool = True
+    repr: SentenceReprConfig = field(default_factory=SentenceReprConfig)
 
 
 @dataclass
@@ -116,6 +140,7 @@ class SLPAConfig(BaseConfig):
     metrics_enable: bool = True
     alpha_decay: str = "none"
     alpha_min_ratio: float = 0.1
+    repr: SentenceReprConfig = field(default_factory=SentenceReprConfig)
 
 
 @dataclass
@@ -150,6 +175,7 @@ class SCRConfig(BaseConfig):
     metrics_enable: bool = True
     alpha_decay: str = "none"
     alpha_min_ratio: float = 0.1
+    repr: SentenceReprConfig = field(default_factory=SentenceReprConfig)
 
 
 @dataclass

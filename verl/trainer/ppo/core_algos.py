@@ -36,6 +36,62 @@ from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
 
+def _compute_repr_diagnostic_metrics(
+    sent_emb: torch.Tensor,
+    sent_score: torch.Tensor,
+    sent_correct_mask: torch.Tensor,
+    metrics: dict,
+    *,
+    prefix: str,
+    max_pairs: int = 4096,
+) -> None:
+    """Add per-batch sentence-representation health metrics in-place.
+
+    Args:
+        sent_emb: (S, H) L2-normalized sentence embeddings.
+        sent_score: (S,) scalar score per sentence (e.g., delta, scr_score).
+        sent_correct_mask: (S,) bool, whether the sentence belongs to a correct rollout.
+        metrics: dict to write into.
+        prefix: prefix for metric keys (e.g., "slpa" or "scr").
+        max_pairs: cap on pairs sampled for global cosine to avoid O(S^2).
+    """
+    if sent_emb is None or sent_emb.shape[0] < 2:
+        return
+    s, _ = sent_emb.shape
+    device = sent_emb.device
+    with torch.no_grad():
+        # Subsample for global cosine if too large.
+        n_sample = min(s, int((2 * max_pairs) ** 0.5) + 1)
+        if n_sample < s:
+            perm = torch.randperm(s, device=device)[:n_sample]
+            emb_sample = sent_emb[perm]
+        else:
+            emb_sample = sent_emb
+        sim = emb_sample @ emb_sample.t()
+        # Off-diagonal mean.
+        off_diag = sim - torch.diag_embed(torch.diagonal(sim))
+        n = emb_sample.shape[0]
+        denom = max(n * (n - 1), 1)
+        cos_global = off_diag.sum().item() / denom
+        metrics[f"{prefix}/repr/cos_sim_global_mean"] = float(cos_global)
+
+        # Pos vs neg center cosine gap (1 - cos = distance; >0 means separated).
+        if torch.any(sent_correct_mask) and torch.any(~sent_correct_mask):
+            c_pos = sent_emb[sent_correct_mask].mean(dim=0)
+            c_neg = sent_emb[~sent_correct_mask].mean(dim=0)
+            c_pos = c_pos / (c_pos.norm() + 1e-8)
+            c_neg = c_neg / (c_neg.norm() + 1e-8)
+            gap = 1.0 - float((c_pos * c_neg).sum().item())
+            metrics[f"{prefix}/repr/cos_sim_pos_neg_gap"] = gap
+
+        # Signal variance proxy: var(score) / var(correctness signal).
+        if sent_score.numel() > 1:
+            score_var = float(sent_score.var(unbiased=False).item())
+            ref_var = float(sent_correct_mask.float().var(unbiased=False).item())
+            metrics[f"{prefix}/repr/adv_signal_var"] = score_var
+            metrics[f"{prefix}/repr/adv_signal_snr"] = score_var / (ref_var + 1e-8)
+
+
 PolicyLossFn = Callable[
     [
         torch.Tensor,  # old_log_prob
@@ -706,6 +762,15 @@ def compute_slpa_advantage(
         metrics["slpa/delta_abs_mean"] = float(delta.abs().mean().item())
         metrics["slpa/num_sentences"] = float(num_sent)
         metrics["slpa/num_groups"] = float(num_groups)
+        # Sentence-representation health diagnostics (v1-5-hidden ablation).
+        sent_correct = scores[sent_sample] > float(getattr(slpa_cfg, "correctness_threshold", 0.0))
+        _compute_repr_diagnostic_metrics(
+            sent_emb=sent_emb,
+            sent_score=delta,
+            sent_correct_mask=sent_correct,
+            metrics=metrics,
+            prefix="slpa",
+        )
 
     return slpa_adv, metrics
 
@@ -835,6 +900,15 @@ def compute_scr_advantage(
         metrics["scr/score_mean"] = float(scr_scores.mean().item())
         metrics["scr/score_std"] = float(scr_scores.std(unbiased=False).item()) if num_sent > 1 else 0.0
         metrics["scr/num_sentences"] = float(num_sent)
+        # Sentence-representation health diagnostics (v1-5-hidden ablation).
+        sent_correct = scores[sent_sample] > float(getattr(scr_cfg, "correctness_threshold", 0.0))
+        _compute_repr_diagnostic_metrics(
+            sent_emb=sent_emb,
+            sent_score=scr_scores,
+            sent_correct_mask=sent_correct,
+            metrics=metrics,
+            prefix="scr",
+        )
 
     return scr_adv, metrics
 

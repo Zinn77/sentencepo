@@ -267,57 +267,25 @@ def _pool_sentence_embeddings_from_tokens(
     sentence_ids: torch.Tensor,
     response_mask: torch.Tensor,
     eps: float = 1e-8,
+    *,
+    pooling: str = "last",
+    response_token_ids: torch.Tensor | None = None,
+    token_entropy: torch.Tensor | None = None,
+    punct_token_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    """Pool token-level hidden states into sentence-level embeddings (last-token pooling).
+    """Backward-compatible wrapper around verl.utils.sentence_repr.pool_sentence_embeddings."""
+    from verl.utils.sentence_repr import pool_sentence_embeddings
 
-    Returns (sentence_embeddings, unique_sentence_ids, sentence_sample_idx) or None.
-    """
-    device = token_hidden_states.device
-    sentence_ids = sentence_ids.to(device)
-    response_mask = response_mask.to(device)
-    bs, seq_len, hidden = token_hidden_states.shape
-
-    valid = (response_mask > 0) & (sentence_ids >= 0)
-    if not torch.any(valid):
-        return None
-
-    flat_sid = sentence_ids.view(-1)
-    flat_valid = valid.view(-1)
-    flat_sid_valid = flat_sid[flat_valid]
-    if flat_sid_valid.numel() == 0:
-        return None
-
-    unique_sid, _ = torch.unique(flat_sid_valid, return_inverse=True)
-    num_sent = unique_sid.numel()
-    if num_sent == 0:
-        return None
-
-    # Find last token position per sentence
-    next_sid = torch.roll(sentence_ids, shifts=-1, dims=1)
-    next_valid = torch.roll(valid, shifts=-1, dims=1)
-    last_pos_mask = torch.zeros_like(valid)
-    last_pos_mask[:, -1] = True
-    boundary = last_pos_mask | (sentence_ids != next_sid) | (~next_valid)
-    last_mask = valid & boundary
-
-    flat_last = last_mask.view(-1)
-    flat_sid_last = flat_sid[flat_last]
-    if flat_sid_last.numel() == 0:
-        return None
-
-    idx_last = torch.searchsorted(unique_sid, flat_sid_last)
-
-    # Last-token pooling
-    flat_emb_last = token_hidden_states.view(-1, hidden)[flat_last]
-    sent_emb = torch.zeros((num_sent, hidden), device=device, dtype=token_hidden_states.dtype)
-    sent_emb.index_copy_(0, idx_last, flat_emb_last)
-
-    # Sample index per sentence
-    flat_sample_idx = torch.arange(bs, device=device).unsqueeze(1).expand(bs, seq_len).reshape(-1)
-    sent_sample_idx = torch.zeros((num_sent,), device=device, dtype=torch.long)
-    sent_sample_idx.index_copy_(0, idx_last, flat_sample_idx[flat_last])
-
-    return sent_emb, unique_sid, sent_sample_idx
+    return pool_sentence_embeddings(
+        token_hidden_states=token_hidden_states,
+        sentence_ids=sentence_ids,
+        response_mask=response_mask,
+        pooling=pooling,
+        response_token_ids=response_token_ids,
+        token_entropy=token_entropy,
+        punct_token_ids=punct_token_ids,
+        eps=eps,
+    )
 
 
 def compute_advantage(
@@ -446,9 +414,35 @@ def compute_advantage(
     _sent_emb = _sent_uid = _sent_sidx = None
     if _need_pool and "token_hidden_states" in data.batch.keys():
         _token_hs = data.batch["token_hidden_states"]
+        # Resolve pooling from the first enabled module's repr config (SLPA wins
+        # over SCR if both are on with mismatched configs — the ablation runs
+        # them separately, so this only matters in the combined case).
+        _pool_cfg = None
+        for _c in (slpa_cfg, scr_cfg):
+            if _c is not None and getattr(_c, "enable", False):
+                _pool_cfg = getattr(_c, "repr", None)
+                if _pool_cfg is not None:
+                    break
+        _pooling = getattr(_pool_cfg, "pooling", "last") if _pool_cfg is not None else "last"
+        _resp_ids = data.batch.get("responses") if _pooling == "mean_no_punct" else None
+        # Pad responses to full sequence length (sentence_ids covers full seq).
+        if _resp_ids is not None and _resp_ids.shape[1] != _sentence_ids.shape[1]:
+            _pad = _sentence_ids.shape[1] - _resp_ids.shape[1]
+            _resp_ids = torch.nn.functional.pad(_resp_ids, (_pad, 0), value=0)
+        _ent = data.batch.get("entropys") if _pooling == "entropy_weighted" else None
+        if _ent is not None and _ent.shape[1] != _sentence_ids.shape[1]:
+            _pad = _sentence_ids.shape[1] - _ent.shape[1]
+            _ent = torch.nn.functional.pad(_ent, (_pad, 0), value=0.0)
+        _punct_ids = (data.meta_info or {}).get("punct_token_ids") if _pooling == "mean_no_punct" else None
         with torch.no_grad():
             _pooled = _pool_sentence_embeddings_from_tokens(
-                _token_hs, _sentence_ids, _response_mask
+                _token_hs,
+                _sentence_ids,
+                _response_mask,
+                pooling=_pooling,
+                response_token_ids=_resp_ids,
+                token_entropy=_ent,
+                punct_token_ids=_punct_ids,
             )
         if _pooled is not None:
             _sent_emb, _sent_uid, _sent_sidx = _pooled
@@ -599,6 +593,8 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        # Lazily-built cache of punctuation token ids (used by mean_no_punct pooling).
+        self._punct_token_ids_cache: torch.Tensor | None = None
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
 
@@ -629,6 +625,27 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _maybe_build_punct_token_ids(self) -> "torch.Tensor | None":
+        """Build (and cache) punctuation token ids only if a module asks for mean_no_punct pooling."""
+        if self._punct_token_ids_cache is not None:
+            return self._punct_token_ids_cache
+        algo = self.config.algorithm
+        needed = False
+        for cfg_name in ("sentence_adv", "slpa", "scr"):
+            cfg = getattr(algo, cfg_name, None)
+            if cfg is None or not bool(getattr(cfg, "enable", False)):
+                continue
+            repr_cfg = getattr(cfg, "repr", None)
+            if repr_cfg is not None and getattr(repr_cfg, "pooling", "last") == "mean_no_punct":
+                needed = True
+                break
+        if not needed:
+            return None
+        from verl.utils.sentence_repr import build_punct_token_ids
+
+        self._punct_token_ids_cache = build_punct_token_ids(self.tokenizer)
+        return self._punct_token_ids_cache
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1975,6 +1992,13 @@ class RayPPOTrainer:
                         )  # GRPO adv normalization factor
 
                         _progress = self.global_steps / max(self.total_training_steps, 1)
+                        # Stash punctuation token ids in meta_info if mean_no_punct
+                        # pooling is configured. Lazy-built once per trainer.
+                        _punct_ids = self._maybe_build_punct_token_ids()
+                        if _punct_ids is not None:
+                            if batch.meta_info is None:
+                                batch.meta_info = {}
+                            batch.meta_info["punct_token_ids"] = _punct_ids
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,

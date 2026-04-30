@@ -969,15 +969,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # perform recompute log_prob
         return_hidden_states = bool(data.meta_info.pop("return_hidden_states", False))
         pool_only = bool(data.meta_info.pop("sentence_adv_pool_only", False))
-        if not return_hidden_states and hasattr(self.config, "algorithm"):
+        sentence_adv_cfg = None
+        slpa_cfg = None
+        scr_cfg = None
+        if hasattr(self.config, "algorithm"):
             sentence_adv_cfg = getattr(self.config.algorithm, "sentence_adv", None)
             slpa_cfg = getattr(self.config.algorithm, "slpa", None)
             scr_cfg = getattr(self.config.algorithm, "scr", None)
-            return_hidden_states = (
-                bool(getattr(sentence_adv_cfg, "enable", False))
-                or bool(getattr(slpa_cfg, "enable", False))
-                or bool(getattr(scr_cfg, "enable", False))
-            )
+            if not return_hidden_states:
+                return_hidden_states = (
+                    bool(getattr(sentence_adv_cfg, "enable", False))
+                    or bool(getattr(slpa_cfg, "enable", False))
+                    or bool(getattr(scr_cfg, "enable", False))
+                )
+        # Resolve hidden_layer_index from the first enabled module's repr config.
+        # Trainer-set value (data.meta_info) takes precedence.
+        if return_hidden_states and "hidden_layer_index" not in data.meta_info:
+            for cfg in (sentence_adv_cfg, slpa_cfg, scr_cfg):
+                if cfg is not None and bool(getattr(cfg, "enable", False)):
+                    repr_cfg = getattr(cfg, "repr", None)
+                    if repr_cfg is not None:
+                        data.meta_info["hidden_layer_index"] = getattr(
+                            repr_cfg, "hidden_layer_index", -1
+                        )
+                        break
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 output, entropys, hidden_states = self.actor.compute_log_prob(

@@ -47,6 +47,37 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _select_hidden_layer(
+    hidden_states_tuple,
+    layer_index: "int | list[int]",
+) -> torch.Tensor:
+    """Return one hidden-state tensor from a HF model's output.hidden_states.
+
+    Accepts either a single int (use that layer) or a list/tuple/ListConfig of
+    ints (mean of those layers). HF returns ``num_layers + 1`` tensors (input
+    embeddings plus one per block); negative indices follow Python list
+    semantics.
+    """
+    # Bool is a subclass of int — reject explicitly to catch config typos.
+    if isinstance(layer_index, bool):
+        raise TypeError(f"hidden_layer_index must not be bool, got {layer_index}")
+    if isinstance(layer_index, int):
+        return hidden_states_tuple[layer_index]
+    # OmegaConf ListConfig does not inherit from list, so use a duck-typed check.
+    try:
+        idx_list = [int(i) for i in layer_index]
+    except TypeError as e:
+        raise TypeError(
+            f"hidden_layer_index must be int or iterable of ints, got {type(layer_index)}"
+        ) from e
+    if len(idx_list) == 0:
+        return hidden_states_tuple[-1]
+    if len(idx_list) == 1:
+        return hidden_states_tuple[idx_list[0]]
+    stacked = torch.stack([hidden_states_tuple[i] for i in idx_list], dim=0)
+    return stacked.mean(dim=0)
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
@@ -85,7 +116,7 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def _find_last_transformer_block(self) -> nn.Module | None:
+    def _find_transformer_blocks(self) -> "nn.ModuleList | list | tuple | None":
         module = getattr(self.actor_module, "_fsdp_wrapped_module", self.actor_module)
         candidates = (
             ("model", "layers"),
@@ -107,8 +138,21 @@ class DataParallelPPOActor(BasePPOActor):
             if not ok:
                 continue
             if isinstance(obj, (nn.ModuleList, list, tuple)) and len(obj) > 0:
-                return obj[-1]
+                return obj
         return None
+
+    def _find_last_transformer_block(self) -> nn.Module | None:
+        blocks = self._find_transformer_blocks()
+        return blocks[-1] if blocks is not None else None
+
+    def _find_transformer_block(self, layer_idx: int) -> nn.Module | None:
+        blocks = self._find_transformer_blocks()
+        if blocks is None:
+            return None
+        try:
+            return blocks[layer_idx]
+        except IndexError:
+            return None
 
     def _forward_micro_batch(
         self,
@@ -117,6 +161,7 @@ class DataParallelPPOActor(BasePPOActor):
         calculate_entropy=False,
         return_hidden_states: bool = False,
         return_last_hidden_state_only: bool = False,
+        hidden_layer_index: "int | list[int]" = -1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Returns:
@@ -144,8 +189,14 @@ class DataParallelPPOActor(BasePPOActor):
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)
 
-            if return_hidden_states and return_last_hidden_state_only:
-                block = self._find_last_transformer_block()
+            # Hook-based extraction is only valid when:
+            #   - caller asked for last_hidden_state_only (memory optimization)
+            #   - AND we want a single, fixed layer (int, not list)
+            # For non-default layers or layer-ensemble, fall back to
+            # output_hidden_states=True so we can index into the full stack.
+            single_layer = isinstance(hidden_layer_index, int)
+            if return_hidden_states and return_last_hidden_state_only and single_layer:
+                block = self._find_transformer_block(hidden_layer_index)
                 if block is not None:
                     use_hook = True
 
@@ -230,7 +281,9 @@ class DataParallelPPOActor(BasePPOActor):
                     if calculate_entropy:
                         entropy_rmpad = output.entropy.squeeze(0)
                     if return_hidden_states and not use_hook and hasattr(output, "hidden_states"):
-                        hidden_states_rmpad = output.hidden_states[-1].squeeze(0)
+                        hidden_states_rmpad = _select_hidden_layer(
+                            output.hidden_states, hidden_layer_index
+                        ).squeeze(0)
                 else:
                     logits_rmpad = output.logits.squeeze(0)
                     logits_rmpad.div_(temperature)
@@ -250,7 +303,9 @@ class DataParallelPPOActor(BasePPOActor):
                                 self.compute_entropy_from_logits, logits_rmpad
                             )
                     if return_hidden_states and not use_hook and hasattr(output, "hidden_states"):
-                        hidden_states_rmpad = output.hidden_states[-1].squeeze(0)
+                        hidden_states_rmpad = _select_hidden_layer(
+                            output.hidden_states, hidden_layer_index
+                        ).squeeze(0)
 
                 if return_hidden_states and use_hook and last_hidden is not None:
                     hidden_states_rmpad = last_hidden.squeeze(0)
@@ -334,7 +389,9 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
                 if return_hidden_states and not use_hook and hasattr(output, "hidden_states"):
-                    hidden_states = output.hidden_states[-1][:, -response_length - 1 : -1, :]
+                    hidden_states = _select_hidden_layer(
+                        output.hidden_states, hidden_layer_index
+                    )[:, -response_length - 1 : -1, :]
                 if return_hidden_states and use_hook and last_hidden is not None:
                     hidden_states = last_hidden[:, -response_length - 1 : -1, :]
 
@@ -389,6 +446,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         return_last_hidden_state_only = bool(data.meta_info.get("return_last_hidden_state_only", False))
+        hidden_layer_index = data.meta_info.get("hidden_layer_index", -1)
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -414,6 +472,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy=calculate_entropy,
                     return_hidden_states=return_hidden_states,
                     return_last_hidden_state_only=return_last_hidden_state_only,
+                    hidden_layer_index=hidden_layer_index,
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
