@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Phase B parametric script for v1-5-hidden ablation.
+# v1-5-hidden 消融的 Phase B 单 run 参数化脚本。
 #
-#   MODULE   = scr | slpa | none      (which sentence-adv module to enable)
-#   LAYER    = int (e.g. -1, -9, -18) or "-1|-9|-18" for ensemble mean
+#   MODULE   = scr | slpa | none      （启用哪个句子级 advantage 模块）
+#   LAYER    = int (例如 -1 / -9 / -18) 或 "-1|-9|-18" 表示多层 ensemble mean
 #   POOLING  = last | mean | first | mean_no_punct | entropy_weighted | diff
-#   ALPHA    = fusion weight (default 0.05)
+#   ALPHA    = 融合权重（默认 0.05）
 #
-# Example:
+# 示例：
 #   MODULE=scr LAYER=-9 POOLING=mean ALPHA=0.05 SEED=42 EPOCHS=1 \
 #     bash test_v1-5_hidden_phaseB.sh
+#
+# 一般由 test_v1-5_hidden_pipeline.sh 调用；单独运行也行（例如失败后想重跑
+# 某一个 run，或者用 PHASEB_ONLY 跑指定的某一个）。
 set -ex
 
 MODULE=${MODULE:-scr}
@@ -23,17 +26,27 @@ EXP_TAG_OVERRIDE=${EXP_TAG_OVERRIDE:-}
 export PYTHONHASHSEED=$SEED
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-TOT_PATH=${TOT_PATH:-/mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/yangfengkai02}
-MODEL_PATH=${MODEL_PATH:-${TOT_PATH}/huggingface.co/Qwen/Qwen3-4B-Base}
+# HF 缓存（MODEL_PATH 是 hub id 时，Qwen3-4B-Base 从缓存里解析加载）。
+export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+export HF_HOME=${HF_HOME:-$HOME/autodl-tmp/huggingface}
+export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub
+export TRANSFORMERS_CACHE=$HF_HOME/transformers
+
+MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B-Base}
 MODEL_NAME=${MODEL_NAME:-qwen3_4b}
 
-math_train_path=${TOT_PATH}/data/math/train.parquet
-math500_test_path=${TOT_PATH}/data/math500/test.parquet
-aime2024_test_path=${TOT_PATH}/data/aime2024/test.parquet
-aime2025_test_path=${TOT_PATH}/data/aime2025/test.parquet
-amc23_test_path=${TOT_PATH}/data/amc23/test.parquet
-minerva_test_path=${TOT_PATH}/data/minerva/test.parquet
-olympiad_train_path=${TOT_PATH}/data/olympiad/train.parquet
+# 本地路径（机器布局不同时通过 env 变量覆盖）。
+DATA_DIR=${DATA_DIR:-$HOME/data}
+OUTPUT_DIR=${OUTPUT_DIR:-$HOME/autodl-tmp/models_v1-5}
+REPO_DIR=${REPO_DIR:-$HOME/sentencepo_v1-5}
+
+math_train_path=${DATA_DIR}/math/train.parquet
+math500_test_path=${DATA_DIR}/math500/test.parquet
+aime2024_test_path=${DATA_DIR}/aime2024/test.parquet
+aime2025_test_path=${DATA_DIR}/aime2025/test.parquet
+amc23_test_path=${DATA_DIR}/amc23/test.parquet
+minerva_test_path=${DATA_DIR}/minerva/test.parquet
+olympiad_train_path=${DATA_DIR}/olympiad/train.parquet
 train_files="['$math_train_path']"
 test_files="['$math500_test_path', '$aime2024_test_path', '$aime2025_test_path', '$amc23_test_path', '$minerva_test_path', '$olympiad_train_path']"
 
@@ -47,7 +60,7 @@ LOSS_MODE=vanilla
 clip_ratio_low=0.2
 clip_ratio_high=0.2
 
-# === Module enable flags ===
+# === 模块启用开关 ===
 if [ "$MODULE" = "scr" ]; then
     scr_enable=true
     slpa_enable=false
@@ -64,24 +77,24 @@ if [ "$slpa_enable" = "true" ] || [ "$scr_enable" = "true" ]; then
     NEED_SENTENCEPO=true
 fi
 
-# === Convert layer spec ===
-# Hydra accepts a list literal like [-1,-9,-18] for list-typed fields,
-# and an int like -9 for int-typed fields. We always pass a Python literal
-# string; the SentenceReprConfig.hidden_layer_index field is `Any`.
+# === 转换 layer 规格 ===
+# Hydra 对 list 类字段接收形如 [-1,-9,-18] 的 list literal，对 int 类字段接收
+# -9 这样的整数。SentenceReprConfig.hidden_layer_index 字段是 Any，所以这里
+# 统一传 Python literal 字符串即可。
 if [[ "$LAYER" == *"|"* ]]; then
     LAYER_ARG="[$(echo "$LAYER" | tr '|' ',')]"
 else
     LAYER_ARG="$LAYER"
 fi
 
-# === Experiment tag ===
+# === 实验 tag ===
 LAYER_TAG=$(echo "$LAYER" | tr '|' '_' | tr '-' 'm')
 EXP_TAG=${EXP_TAG_OVERRIDE:-"${MODULE}_L${LAYER_TAG}_P${POOLING}_a${ALPHA}"}
-TOT_DIR="${TOT_PATH}/models_v1-5/${EXP_TAG}_${DS}_${MODEL_NAME}_ep${EPOCHS}_rand${SEED}"
+TOT_DIR="${OUTPUT_DIR}/${EXP_TAG}_${DS}_${MODEL_NAME}_ep${EPOCHS}_rand${SEED}"
 mkdir -p $TOT_DIR
 mkdir -p $TOT_DIR/verl_checkpoints_v1-5
 
-# === Standard sentencepo loss params (loss=vanilla so most are inert) ===
+# === sentencepo loss 标准参数（loss=vanilla 时大多数是惰性的，不会被用到） ===
 sentencepo_min_sent_tokens=6
 sentencepo_eps_base=0.01
 sentencepo_lambda_ppl=0
@@ -92,7 +105,7 @@ sentencepo_stats_eps=1e-6
 sentencepo_metrics_level=full
 sentencepo_per_sentence_adv=false
 
-# === SLPA defaults ===
+# === SLPA 默认参数 ===
 slpa_alpha_correct=$ALPHA
 slpa_alpha_incorrect=$ALPHA
 slpa_tau_emb=0.1
@@ -104,7 +117,7 @@ slpa_metrics_enable=true
 slpa_alpha_decay=none
 slpa_alpha_min_ratio=0.1
 
-# === SCR defaults ===
+# === SCR 默认参数 ===
 scr_alpha_correct=$ALPHA
 scr_alpha_incorrect=$ALPHA
 scr_tau_reward=1.0
@@ -116,7 +129,7 @@ scr_metrics_enable=true
 scr_alpha_decay=none
 scr_alpha_min_ratio=0.1
 
-export PYTHONPATH="${TOT_PATH}/sentencepo_v1-5:$PYTHONPATH"
+export PYTHONPATH="${REPO_DIR}:$PYTHONPATH"
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +data.seed=$SEED \
     +critic.data_loader_seed=$SEED \
