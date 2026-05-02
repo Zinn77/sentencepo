@@ -87,11 +87,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--layers",
         type=str,
-        default="-1,-4,-9,-18,-1|-9|-18",
+        # Qwen3-4B has 36 transformer blocks + 1 input embedding (37 hidden_states).
+        # Negative index goes from output toward input: -1=last block,
+        # -36=first block, -37=input embedding (raw token lookup, usually useless).
+        # Sweep covers output → middle → near-input, plus two ensembles.
+        default="-1,-4,-9,-18,-27,-32,-36,-1|-9|-18,-9|-18|-27",
         help="comma-separated layer indices; '|' inside an entry => list (ensemble mean).",
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--min_sent_tokens", type=int, default=6)
+    p.add_argument(
+        "--artifacts_dir",
+        type=str,
+        default="",
+        help="Where to save paper-grade artifacts (config.json, rollouts.jsonl, "
+        "sweep_metrics.csv, sentence_embeddings/). Default = next to --output_md "
+        "as <stem>_artifacts/.",
+    )
+    p.add_argument(
+        "--save_embeddings",
+        action="store_true",
+        help="Also save per-(layer, pooling) sent_emb / sent_correct / sent_reward "
+        "for downstream visualizations (PCA / t-SNE). Adds ~10 MB per combo.",
+    )
     return p.parse_args()
 
 
@@ -272,6 +290,9 @@ def repr_metrics(
     if s < 2:
         return {}
     out: dict[str, float] = {}
+    out["n_sentences"] = int(s)
+    out["n_correct"] = int(sent_correct.sum().item())
+    out["n_wrong"] = int((~sent_correct).sum().item())
     n = min(s, 96)
     perm = torch.randperm(s, device=sent_emb.device)[:n]
     sub = sent_emb[perm]
@@ -279,8 +300,17 @@ def repr_metrics(
     off = sim - torch.diag_embed(torch.diagonal(sim))
     out["cos_global"] = float(off.sum().item() / max(n * (n - 1), 1))
     if sent_correct.any() and (~sent_correct).any():
-        c_pos = F.normalize(sent_emb[sent_correct].mean(dim=0), dim=-1)
-        c_neg = F.normalize(sent_emb[~sent_correct].mean(dim=0), dim=-1)
+        # Save the PRE-normalize means' magnitudes. When |pos_pre| / |neg_pre|
+        # are tiny (≪ 1), the embedding distribution is near-uniform on the
+        # sphere → F.normalize forces direction from numerical noise → the
+        # resulting pos_neg_gap = 1 - cos(c_pos, c_neg) is dominated by random
+        # directions and not by class structure. See `composite()` filter.
+        pos_pre = sent_emb[sent_correct].mean(dim=0)
+        neg_pre = sent_emb[~sent_correct].mean(dim=0)
+        out["c_pos_norm"] = float(pos_pre.norm().item())
+        out["c_neg_norm"] = float(neg_pre.norm().item())
+        c_pos = F.normalize(pos_pre, dim=-1)
+        c_neg = F.normalize(neg_pre, dim=-1)
         out["pos_neg_gap"] = float(1.0 - (c_pos * c_neg).sum().item())
     if sent_score.numel() > 1:
         out["score_var"] = float(sent_score.var(unbiased=False).item())
@@ -621,6 +651,7 @@ def main() -> None:
 
     # Sweep.
     rows: list[dict] = []
+    sent_emb_buffers: list[dict] = []  # populated only when --save_embeddings
     for layer in layers:
         layer_label = str(layer) if isinstance(layer, int) else "|".join(str(int(x)) for x in layer)
         if isinstance(layer, int):
@@ -650,39 +681,175 @@ def main() -> None:
             sent_reward = rewards[sent_sample.cpu()].to(sent_emb.device)
             sent_correct = sent_reward > 0.0
 
-            # SCR-style metrics.
             scr_score = scr_style_score(sent_emb, sent_sample.to(sent_emb.device), sent_reward)
             scr_m = repr_metrics(sent_emb, scr_score, sent_correct)
-            # SLPA-style metrics.
             slpa_score = slpa_style_score(sent_emb, sent_sample.to(sent_emb.device), sent_reward)
             slpa_m = repr_metrics(sent_emb, slpa_score, sent_correct)
+            # cos_global / pos_neg_gap / c_*_norm / n_* depend only on sent_emb,
+            # so they are identical between scr_m and slpa_m. Keep single column
+            # for those, scr_/slpa_ prefix only on score-dependent metrics.
             rows.append({
                 "layer": layer_label,
                 "pooling": pooling,
-                "scr_cos_global": scr_m.get("cos_global", float("nan")),
-                "scr_gap": scr_m.get("pos_neg_gap", float("nan")),
+                "n_sentences": scr_m.get("n_sentences", 0),
+                "n_correct": scr_m.get("n_correct", 0),
+                "n_wrong": scr_m.get("n_wrong", 0),
+                "cos_global": scr_m.get("cos_global", float("nan")),
+                "pos_neg_gap": scr_m.get("pos_neg_gap", float("nan")),
+                "c_pos_norm": scr_m.get("c_pos_norm", float("nan")),
+                "c_neg_norm": scr_m.get("c_neg_norm", float("nan")),
+                "scr_score_var": scr_m.get("score_var", float("nan")),
                 "scr_snr": scr_m.get("snr", float("nan")),
-                "slpa_cos_global": slpa_m.get("cos_global", float("nan")),
-                "slpa_gap": slpa_m.get("pos_neg_gap", float("nan")),
+                "slpa_score_var": slpa_m.get("score_var", float("nan")),
                 "slpa_snr": slpa_m.get("snr", float("nan")),
             })
-            print(f"  layer={layer_label} pooling={pooling}  scr_gap={scr_m.get('pos_neg_gap', 0):.4f}  slpa_gap={slpa_m.get('pos_neg_gap', 0):.4f}", flush=True)
+            print(
+                f"  layer={layer_label:>12} pooling={pooling:<18}"
+                f"  cos={scr_m.get('cos_global', 0):.3f}"
+                f"  gap={scr_m.get('pos_neg_gap', 0):.4f}"
+                f"  |c+|={scr_m.get('c_pos_norm', 0):.3f}"
+                f"  |c-|={scr_m.get('c_neg_norm', 0):.3f}"
+                f"  scr_snr={scr_m.get('snr', 0):.3g}",
+                flush=True,
+            )
 
-    # Rank.
+            if args.save_embeddings:
+                sent_emb_buffers.append({
+                    "layer": layer_label,
+                    "pooling": pooling,
+                    "sent_emb": sent_emb.detach().cpu().to(torch.bfloat16),
+                    "sent_sample": sent_sample.detach().cpu(),
+                    "sent_reward": sent_reward.detach().cpu(),
+                    "sent_correct": sent_correct.detach().cpu(),
+                })
+
+    # Rank with cos_global filter on both ends:
+    #   - cos > 0.95 : embeddings collapsed onto a single direction (e.g. all
+    #                  near the same context vector); gap measure trivially 0.
+    #   - cos < 0.05 : embeddings near-uniform on the sphere (e.g. `diff`
+    #                  pooling). Per-class means have magnitudes ~1/sqrt(N),
+    #                  F.normalize forces direction from numerical noise, and
+    #                  E[1 - cos(c+, c-)] ≈ 1 by chance. The "high gap" is a
+    #                  noise artifact, not class separation. The c_pos_norm /
+    #                  c_neg_norm columns make this directly visible.
+    COS_LOW = 0.05
+    COS_HIGH = 0.95
+
+    def filter_reason(row) -> str:
+        cos = row["cos_global"]
+        gap = row["pos_neg_gap"]
+        if cos != cos:
+            return "cos_global is NaN"
+        if cos > COS_HIGH:
+            return f"cos_global={cos:.3f} > {COS_HIGH} (collapsed embeddings)"
+        if cos < COS_LOW:
+            return f"cos_global={cos:.3f} < {COS_LOW} (near-uniform → gap is noise)"
+        if gap != gap:
+            return "pos_neg_gap is NaN (no pos/neg split)"
+        return ""
+
     def composite(row, mod: str) -> float:
-        gap = row[f"{mod}_gap"]
         snr = row[f"{mod}_snr"]
-        cos = row[f"{mod}_cos_global"]
-        if cos != cos or cos > 0.95:  # NaN or collapsed
+        gap = row["pos_neg_gap"]
+        if filter_reason(row):
             return float("-inf")
-        if gap != gap or snr != snr:
+        if snr != snr:
             return float("-inf")
         return gap + 0.1 * snr
 
     scr_ranked = sorted(rows, key=lambda r: composite(r, "scr"), reverse=True)
     slpa_ranked = sorted(rows, key=lambda r: composite(r, "slpa"), reverse=True)
 
-    # Output markdown.
+    # ---- Save artifacts (config.json, rollouts.jsonl, sweep_metrics.csv,
+    # optional sentence_embeddings/) for downstream paper analysis. ----
+    import csv
+    import json
+    import subprocess
+    from datetime import datetime, timezone
+
+    out_md_path = Path(args.output_md)
+    if args.artifacts_dir:
+        artifacts_dir = Path(args.artifacts_dir)
+    else:
+        artifacts_dir = out_md_path.parent / f"{out_md_path.stem}_artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving artifacts to {artifacts_dir}", flush=True)
+
+    config_payload = vars(args).copy()
+    config_payload["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+    config_payload["torch_version"] = torch.__version__
+    try:
+        import vllm
+
+        config_payload["vllm_version"] = vllm.__version__
+    except Exception:
+        config_payload["vllm_version"] = None
+    try:
+        import transformers
+
+        config_payload["transformers_version"] = transformers.__version__
+    except Exception:
+        config_payload["transformers_version"] = None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        config_payload["git_commit"] = result.stdout.strip() or None
+    except Exception:
+        config_payload["git_commit"] = None
+    config_payload["reward_pos_frac"] = float((rewards > 0).float().mean().item())
+    config_payload["num_rollouts"] = int(rewards.numel())
+    (artifacts_dir / "config.json").write_text(
+        json.dumps(config_payload, indent=2, ensure_ascii=False)
+    )
+
+    with (artifacts_dir / "rollouts.jsonl").open("w", encoding="utf-8") as f:
+        for i in range(len(all_response_ids)):
+            prompt_idx = i // args.rollouts_per_prompt
+            rollout_idx = i % args.rollouts_per_prompt
+            valid_len = int(all_response_mask[i].sum().item())
+            resp_ids_valid = all_response_ids[i][:valid_len].tolist()
+            response_text = tokenizer.decode(resp_ids_valid, skip_special_tokens=True)
+            f.write(
+                json.dumps(
+                    {
+                        "prompt_idx": prompt_idx,
+                        "rollout_idx": rollout_idx,
+                        "ground_truth": answers[prompt_idx],
+                        "response_text": response_text,
+                        "response_len_tokens": valid_len,
+                        "reward": float(all_rewards[i]),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    csv_fields = list(rows[0].keys()) if rows else []
+    csv_fields.append("filtered_reason")
+    with (artifacts_dir / "sweep_metrics.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields)
+        writer.writeheader()
+        for r in rows:
+            row_out = dict(r)
+            row_out["filtered_reason"] = filter_reason(r)
+            writer.writerow(row_out)
+
+    if args.save_embeddings and sent_emb_buffers:
+        emb_dir = artifacts_dir / "sentence_embeddings"
+        emb_dir.mkdir(exist_ok=True)
+        for buf in sent_emb_buffers:
+            safe_layer = buf["layer"].replace("|", "x")
+            torch.save(
+                buf,
+                emb_dir / f"layer_{safe_layer}_pooling_{buf['pooling']}.pt",
+            )
+
+    # ---- Markdown summary (human-readable) ----
     os.makedirs(os.path.dirname(args.output_md), exist_ok=True)
     lines: list[str] = []
     lines.append("# v1-5-hidden Phase A Diagnostic")
@@ -690,32 +857,68 @@ def main() -> None:
     lines.append(f"- Model: `{args.model_path}`")
     lines.append(f"- Prompts: {args.num_prompts}, rollouts/prompt: {args.rollouts_per_prompt}")
     lines.append(f"- Reward pos frac: {(rewards > 0).float().mean():.3f}")
-    lines.append(f"- Total sentences across all rollouts: see per-row counts")
+    lines.append(f"- Sweep covers {len(layers)} layer specs × {len(poolings)} poolings")
+    lines.append(f"- Artifacts: `{artifacts_dir}` (config.json, rollouts.jsonl, sweep_metrics.csv"
+                 f"{', sentence_embeddings/' if args.save_embeddings else ''})")
     lines.append("")
     lines.append("## Full sweep")
     lines.append("")
-    lines.append("| layer | pooling | scr_cos_global | scr_gap | scr_snr | slpa_cos_global | slpa_gap | slpa_snr |")
-    lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+    lines.append("`gap` and `cos_global` depend on `sent_emb` only → identical between SCR and SLPA. "
+                 "`|c+|` / `|c-|` are the **pre-normalize** magnitudes of class-mean embeddings — "
+                 "small values (≪ 1) mean F.normalize is forcing direction from numerical noise, "
+                 "so the corresponding `gap` is a noise artifact, not real class separation.")
+    lines.append("")
+    lines.append("| layer | pooling | n_pos/n | cos_global | gap | \\|c+\\| | \\|c-\\| | scr_snr | slpa_snr |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
     for r in rows:
         lines.append(
             f"| {r['layer']} | {r['pooling']} | "
-            f"{r['scr_cos_global']:.4f} | {r['scr_gap']:.4f} | {r['scr_snr']:.4g} | "
-            f"{r['slpa_cos_global']:.4f} | {r['slpa_gap']:.4f} | {r['slpa_snr']:.4g} |"
+            f"{r['n_correct']}/{r['n_sentences']} | "
+            f"{r['cos_global']:.4f} | {r['pos_neg_gap']:.4f} | "
+            f"{r['c_pos_norm']:.3f} | {r['c_neg_norm']:.3f} | "
+            f"{r['scr_snr']:.4g} | {r['slpa_snr']:.4g} |"
         )
     lines.append("")
-    lines.append("## Top 5 for SCR (rank by gap + 0.1 * snr, drop cos_global > 0.95)")
+    lines.append(f"## Filtered out (cos_global ∉ [{COS_LOW}, {COS_HIGH}] or gap is NaN)")
     lines.append("")
-    lines.append("| rank | layer | pooling | gap | snr | cos_global |")
-    lines.append("|---|---|---|---:|---:|---:|")
+    lines.append("These rows are excluded from the SCR / SLPA top-K rankings below.")
+    lines.append("")
+    lines.append("| layer | pooling | reason |")
+    lines.append("|---|---|---|")
+    any_filtered = False
+    for r in rows:
+        reason = filter_reason(r)
+        if reason:
+            any_filtered = True
+            lines.append(f"| {r['layer']} | {r['pooling']} | {reason} |")
+    if not any_filtered:
+        lines.append("| — | — | (none) |")
+    lines.append("")
+    lines.append(f"## Top 5 for SCR (composite = gap + 0.1 · scr_snr, after filter)")
+    lines.append("")
+    lines.append("| rank | layer | pooling | gap | scr_snr | cos_global | \\|c+\\| | \\|c-\\| |")
+    lines.append("|---|---|---|---:|---:|---:|---:|---:|")
     for i, r in enumerate(scr_ranked[:5]):
-        lines.append(f"| {i + 1} | {r['layer']} | {r['pooling']} | {r['scr_gap']:.4f} | {r['scr_snr']:.4g} | {r['scr_cos_global']:.4f} |")
+        if filter_reason(r):
+            continue
+        lines.append(
+            f"| {i + 1} | {r['layer']} | {r['pooling']} | "
+            f"{r['pos_neg_gap']:.4f} | {r['scr_snr']:.4g} | {r['cos_global']:.4f} | "
+            f"{r['c_pos_norm']:.3f} | {r['c_neg_norm']:.3f} |"
+        )
     lines.append("")
-    lines.append("## Top 5 for SLPA")
+    lines.append(f"## Top 5 for SLPA (composite = gap + 0.1 · slpa_snr, after filter)")
     lines.append("")
-    lines.append("| rank | layer | pooling | gap | snr | cos_global |")
-    lines.append("|---|---|---|---:|---:|---:|")
+    lines.append("| rank | layer | pooling | gap | slpa_snr | cos_global | \\|c+\\| | \\|c-\\| |")
+    lines.append("|---|---|---|---:|---:|---:|---:|---:|")
     for i, r in enumerate(slpa_ranked[:5]):
-        lines.append(f"| {i + 1} | {r['layer']} | {r['pooling']} | {r['slpa_gap']:.4f} | {r['slpa_snr']:.4g} | {r['slpa_cos_global']:.4f} |")
+        if filter_reason(r):
+            continue
+        lines.append(
+            f"| {i + 1} | {r['layer']} | {r['pooling']} | "
+            f"{r['pos_neg_gap']:.4f} | {r['slpa_snr']:.4g} | {r['cos_global']:.4f} | "
+            f"{r['c_pos_norm']:.3f} | {r['c_neg_norm']:.3f} |"
+        )
     lines.append("")
 
     Path(args.output_md).write_text("\n".join(lines))

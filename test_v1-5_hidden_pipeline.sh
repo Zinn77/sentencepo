@@ -119,6 +119,7 @@ if [ "${SKIP_PHASE_A:-0}" != "1" ]; then
         --max_new_tokens 4096 \
         --forward_chunk_size 4 \
         --forward_world_size 8 \
+        --save_embeddings \
         --seed "$SEED"
     echo "Phase A 完成。请查看 $PHASE_A_OUT，若与默认 top1/top2 不一致，覆盖 SCR_*/SLPA_* 环境变量后再跑 Phase B。"
 fi
