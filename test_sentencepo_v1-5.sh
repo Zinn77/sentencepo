@@ -4,6 +4,8 @@ set -ex
 # 固定随机数种子
 SEED=${SEED:-42}
 export PYTHONHASHSEED=$SEED
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export FLASH_ATTENTION_DETERMINISTIC=1
 
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HOME=$HOME/autodl-tmp/huggingface

@@ -66,6 +66,8 @@ export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub
 export TRANSFORMERS_CACHE=$HF_HOME/transformers
 export PYTHONPATH=$REPO_DIR:$PYTHONPATH
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export FLASH_ATTENTION_DETERMINISTIC=1
 
 # === 实验旋钮 ===
 SEED=${SEED:-42}
@@ -98,13 +100,16 @@ if [ "${SKIP_PHASE_A:-0}" != "1" ]; then
     echo "  输出：$PHASE_A_OUT"
     echo "============================================================"
     mkdir -p "$(dirname "$PHASE_A_OUT")"
+    # Phase A 与正式 RL 训练对齐：用 apply_chat_template、enable_thinking=False、
+    # max_prompt_length=1024、max_response_length=4096（详见 phaseB.sh）。
     python3 scripts_server/diagnose_sentence_repr.py \
         --model_path "$MODEL_PATH" \
         --train_parquet "$DATA_DIR/math/train.parquet" \
         --output_md "$PHASE_A_OUT" \
         --num_prompts 32 \
         --rollouts_per_prompt 4 \
-        --max_new_tokens 512 \
+        --max_prompt_tokens 1024 \
+        --max_new_tokens 4096 \
         --seed "$SEED"
     echo "Phase A 完成。请查看 $PHASE_A_OUT，若与默认 top1/top2 不一致，覆盖 SCR_*/SLPA_* 环境变量后再跑 Phase B。"
 fi

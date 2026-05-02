@@ -25,6 +25,8 @@ EXP_TAG_OVERRIDE=${EXP_TAG_OVERRIDE:-}
 
 export PYTHONHASHSEED=$SEED
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export FLASH_ATTENTION_DETERMINISTIC=1
 
 # HF 缓存（MODEL_PATH 是 hub id 时，Qwen3-4B-Base 从缓存里解析加载）。
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}

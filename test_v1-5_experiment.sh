@@ -13,6 +13,8 @@ set -ex
 # === 基本设置 ===
 SEED=${SEED:-42}
 export PYTHONHASHSEED=$SEED
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export FLASH_ATTENTION_DETERMINISTIC=1
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HOME=$HOME/autodl-tmp/huggingface
 export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub
