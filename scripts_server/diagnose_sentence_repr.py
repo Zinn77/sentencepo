@@ -312,8 +312,20 @@ def main() -> None:
     print("Building sentence ids...", flush=True)
     sentence_ids = build_sentence_ids(response_ids, response_mask, tokenizer, args.min_sent_tokens)
 
-    # Forward with all-layer hidden states.
+    # Single forward with all-layer hidden states; we also reuse out.logits
+    # for token entropy so there's no second forward pass.
     print("Running forward (with all hidden states)...", flush=True)
+    response_len = response_ids.shape[1]
+
+    # Only extract the layers we'll actually pool — keeps CPU memory bounded.
+    needed_layers: set[int] = set()
+    for layer in layers:
+        if isinstance(layer, int):
+            needed_layers.add(layer)
+        else:
+            for x in layer:
+                needed_layers.add(int(x))
+
     with torch.no_grad():
         out = model(
             input_ids=full_input.cuda(),
@@ -321,22 +333,29 @@ def main() -> None:
             output_hidden_states=True,
             use_cache=False,
         )
-    # Slice each layer's hidden states to the response window.
-    response_len = response_ids.shape[1]
-    response_hs_per_layer = [
-        h[:, -response_len:, :].cpu().float() for h in out.hidden_states
-    ]
-    del out
-    torch.cuda.empty_cache()
 
-    # Token entropy proxy from final logits (for entropy_weighted pooling).
-    print("Computing token entropy from logits...", flush=True)
-    with torch.no_grad():
-        logits = model(input_ids=full_input.cuda(), attention_mask=full_attn.cuda(), use_cache=False).logits
-    response_logits = logits[:, -response_len - 1 : -1, :].float()
-    log_probs = F.log_softmax(response_logits, dim=-1)
-    token_entropy = -(log_probs.exp() * log_probs).sum(dim=-1).cpu()
-    del logits, response_logits, log_probs
+    # Token entropy from logits, chunked over batch. Materializing the full
+    # fp32 softmax (bs × T × |V|) was the OOM source; chunk_size=8 caps the
+    # transient at ~5 GB.
+    print("Computing token entropy from logits (chunked)...", flush=True)
+    chunk_size = 8
+    rl_view = out.logits[:, -response_len - 1 : -1, :]
+    ent_parts: list[torch.Tensor] = []
+    for i in range(0, rl_view.shape[0], chunk_size):
+        lp = F.log_softmax(rl_view[i : i + chunk_size].float(), dim=-1)
+        ent_parts.append((-(lp.exp() * lp).sum(dim=-1)).cpu())
+        del lp
+    token_entropy = torch.cat(ent_parts, dim=0)
+    del rl_view
+
+    # Extract only needed layers; keep bf16 on CPU (fp32 cast at use site).
+    total_layers = len(out.hidden_states)
+    needed_pos = {(i if i >= 0 else total_layers + i) for i in needed_layers}
+    response_hs_per_layer: list[torch.Tensor | None] = [None] * total_layers
+    for idx in needed_pos:
+        response_hs_per_layer[idx] = out.hidden_states[idx][:, -response_len:, :].cpu()
+
+    del out
     torch.cuda.empty_cache()
 
     punct_ids = build_punct_token_ids(tokenizer)
@@ -346,9 +365,11 @@ def main() -> None:
     for layer in layers:
         layer_label = str(layer) if isinstance(layer, int) else "|".join(str(int(x)) for x in layer)
         if isinstance(layer, int):
-            hs = response_hs_per_layer[layer]
+            hs = response_hs_per_layer[layer].float()
         else:
-            hs = torch.stack([response_hs_per_layer[int(x)] for x in layer], dim=0).mean(dim=0)
+            hs = torch.stack(
+                [response_hs_per_layer[int(x)].float() for x in layer], dim=0
+            ).mean(dim=0)
         for pooling in poolings:
             try:
                 pooled = pool_sentence_embeddings(
