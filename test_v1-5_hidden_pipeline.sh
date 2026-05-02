@@ -100,14 +100,21 @@ if [ "${SKIP_PHASE_A:-0}" != "1" ]; then
     echo "  输出：$PHASE_A_OUT"
     echo "============================================================"
     mkdir -p "$(dirname "$PHASE_A_OUT")"
-    # Phase A 与正式 RL 训练对齐：用 apply_chat_template、enable_thinking=False、
-    # max_prompt_length=1024、max_response_length=4096（详见 phaseB.sh）。
+    # Phase A 与正式 RL rollout 严格对齐（详见 phaseB.sh:163-171 + rollout.yaml）：
+    #   引擎 vLLM, TP=8 单进程, n=8, T=1.0, top_p=1.0, top_k=-1,
+    #   max_prompt_length=1024, max_response_length=4096, enable_thinking=False.
+    # 8 卡同时吃满，约 15–25 min。
     python3 scripts_server/diagnose_sentence_repr.py \
         --model_path "$MODEL_PATH" \
         --train_parquet "$DATA_DIR/math/train.parquet" \
         --output_md "$PHASE_A_OUT" \
         --num_prompts 32 \
-        --rollouts_per_prompt 4 \
+        --rollouts_per_prompt 8 \
+        --tensor_parallel_size 8 \
+        --gpu_memory_utilization 0.7 \
+        --temperature 1.0 \
+        --top_p 1.0 \
+        --top_k -1 \
         --max_prompt_tokens 1024 \
         --max_new_tokens 4096 \
         --seed "$SEED"

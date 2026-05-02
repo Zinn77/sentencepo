@@ -5,16 +5,21 @@ Sweeps (hidden_layer × pooling) on a base model, scoring each combo on three
 representation-health metrics for both the SCR-style and SLPA-style
 sentence-advantage objectives. Output is a markdown table that ranks combos.
 
-Self-contained: uses HF transformers (no vllm/Ray). One forward pass over the
-generated rollouts, with output_hidden_states=True, supplies hidden states for
-all candidate layers; pooling and metric computation are then CPU-cheap.
+Two-stage flow:
+  1. Rollout via vLLM (TP=8 by default), with sampling/template aligned to
+     formal RL training in test_v1-5_hidden_phaseB.sh: chat_template +
+     enable_thinking=False, temperature=1.0, top_p=1.0, top_k=-1, n=8.
+  2. After freeing vLLM, load HF on GPU 0 and run a single forward pass with
+     output_hidden_states=True over the collected rollouts. Pooling and metric
+     computation are CPU-cheap.
 
 Usage:
     python scripts_server/diagnose_sentence_repr.py \
-        --model_path /path/to/Qwen3-4B-Base \
-        --train_parquet /path/to/math/train.parquet \
-        --output_md CCdocs/2026-04-27_sentence_repr_diagnostic.md \
-        --num_prompts 32 --rollouts_per_prompt 4 --max_new_tokens 512
+        --model_path Qwen/Qwen3-4B-Base \
+        --train_parquet $HOME/data/math/train.parquet \
+        --output_md CCdocs/2026-05-02_phaseA_diagnostic_v2.md \
+        --num_prompts 32 --rollouts_per_prompt 8 \
+        --tensor_parallel_size 8 --max_prompt_tokens 1024 --max_new_tokens 4096
 """
 
 from __future__ import annotations
@@ -40,11 +45,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train_parquet", required=True, help="math/train.parquet")
     p.add_argument("--output_md", required=True)
     p.add_argument("--num_prompts", type=int, default=32)
-    p.add_argument("--rollouts_per_prompt", type=int, default=4)
-    p.add_argument("--max_prompt_tokens", type=int, default=512)
-    p.add_argument("--max_new_tokens", type=int, default=512)
-    p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--top_p", type=float, default=0.95)
+    # Defaults aligned with formal RL training (test_v1-5_hidden_phaseB.sh +
+    # verl/trainer/config/rollout/rollout.yaml):
+    #   max_prompt_length=1024, max_response_length=4096,
+    #   rollout.n=8, temperature=1.0, top_p=1.0, top_k=-1,
+    #   tensor_parallel_size=1 per replica (we use TP=8 in one process to
+    #   saturate the 8 GPUs we're allocated to Phase A).
+    p.add_argument("--rollouts_per_prompt", type=int, default=8)
+    p.add_argument("--max_prompt_tokens", type=int, default=1024)
+    p.add_argument("--max_new_tokens", type=int, default=4096)
+    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--top_p", type=float, default=1.0)
+    p.add_argument("--top_k", type=int, default=-1)
+    p.add_argument("--tensor_parallel_size", type=int, default=8)
+    p.add_argument("--gpu_memory_utilization", type=float, default=0.7)
+    p.add_argument(
+        "--enable_thinking",
+        action="store_true",
+        help="Pass enable_thinking=True into apply_chat_template (Qwen3 chat). "
+        "Default off to match formal RL config.",
+    )
     p.add_argument(
         "--layers",
         type=str,
@@ -69,20 +89,32 @@ def parse_layers(spec: str) -> list[object]:
     return out
 
 
-def load_prompts(parquet_path: str, num_prompts: int) -> tuple[list[str], list[str]]:
+def load_prompts(parquet_path: str, num_prompts: int) -> tuple[list[list[dict]], list[str]]:
+    """Return (messages_per_prompt, ground_truths).
+
+    Preserves the parquet's chat-message structure so we can apply the same
+    chat template formal RL training uses. Falling back to a synthetic single
+    user-message wrap when the column is just a question string.
+    """
+    import numpy as np
     import pandas as pd
 
     df = pd.read_parquet(parquet_path)
-    prompts: list[str] = []
+    prompts: list[list[dict]] = []
     answers: list[str] = []
     for _, row in df.head(num_prompts).iterrows():
-        # Try a few common column shapes used in verl math parquets.
-        if "prompt" in row and isinstance(row["prompt"], (list, tuple)) and row["prompt"]:
-            prompts.append(row["prompt"][0]["content"])
+        raw_prompt = row["prompt"] if "prompt" in row else None
+        if hasattr(raw_prompt, "tolist"):
+            raw_prompt = raw_prompt.tolist()
+        messages: list[dict] = []
+        if isinstance(raw_prompt, (list, tuple)) and len(raw_prompt) > 0:
+            for m in raw_prompt:
+                messages.append({"role": str(m["role"]), "content": str(m["content"])})
         elif "question" in row:
-            prompts.append(str(row["question"]))
+            messages = [{"role": "user", "content": str(row["question"])}]
         else:
-            prompts.append(str(row.iloc[0]))
+            messages = [{"role": "user", "content": str(row.iloc[0])}]
+        prompts.append(messages)
         if "reward_model" in row and isinstance(row["reward_model"], dict):
             answers.append(str(row["reward_model"].get("ground_truth", "")))
         elif "answer" in row:
@@ -237,58 +269,120 @@ def main() -> None:
     layers = parse_layers(args.layers)
     poolings = list(VALID_POOLINGS)
 
-    print(f"Loading model from {args.model_path}", flush=True)
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    print(f"Loading tokenizer from {args.model_path}", flush=True)
+    from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
-    ).cuda().eval()
 
     print(f"Loading {args.num_prompts} prompts from {args.train_parquet}", flush=True)
-    prompts, answers = load_prompts(args.train_parquet, args.num_prompts)
+    prompts_messages, answers = load_prompts(args.train_parquet, args.num_prompts)
 
-    # Generate rollouts.
-    print(f"Generating {args.rollouts_per_prompt} rollouts per prompt...", flush=True)
+    chat_template_kwargs: dict = {"enable_thinking": bool(args.enable_thinking)}
+    prompt_token_ids_list: list[list[int]] = []
+    for messages in prompts_messages:
+        ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            max_length=args.max_prompt_tokens,
+            truncation=True,
+            **chat_template_kwargs,
+        )
+        prompt_token_ids_list.append(list(ids))
+
+    # ---- Phase 1: vLLM rollout (aligned with formal RL: vllm + TP, n=8, T=1.0). ----
+    from vllm import LLM, SamplingParams
+
+    print(
+        f"Loading vLLM (TP={args.tensor_parallel_size}, "
+        f"gpu_mem_util={args.gpu_memory_utilization})...",
+        flush=True,
+    )
+    llm = LLM(
+        model=args.model_path,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        dtype="bfloat16",
+        max_model_len=args.max_prompt_tokens + args.max_new_tokens,
+        trust_remote_code=True,
+        enforce_eager=False,
+        seed=args.seed,
+    )
+    sampling = SamplingParams(
+        n=args.rollouts_per_prompt,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        max_tokens=args.max_new_tokens,
+        seed=args.seed,
+    )
+    print(
+        f"Generating {args.rollouts_per_prompt} rollouts × "
+        f"{len(prompt_token_ids_list)} prompts via vLLM...",
+        flush=True,
+    )
+    vllm_outputs = llm.generate(
+        prompt_token_ids=prompt_token_ids_list,
+        sampling_params=sampling,
+    )
+
     all_input_ids: list[torch.Tensor] = []
     all_response_mask: list[torch.Tensor] = []
     all_response_ids: list[torch.Tensor] = []
     all_rewards: list[float] = []
-    for p_idx, (prompt, gt) in enumerate(zip(prompts, answers)):
-        prompt_text = prompt
-        enc = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=args.max_prompt_tokens)
-        prompt_ids = enc["input_ids"].cuda()
-        prompt_attn = enc["attention_mask"].cuda()
-        for _ in range(args.rollouts_per_prompt):
-            with torch.no_grad():
-                gen = model.generate(
-                    prompt_ids,
-                    attention_mask=prompt_attn,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=True,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-            full_ids = gen[0]
-            response_ids = full_ids[prompt_ids.shape[1]:]
-            response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+    eos_id = tokenizer.eos_token_id
+    # vLLM preserves input order, so prompt_idx ↔ output index.
+    for prompt_idx, output in enumerate(vllm_outputs):
+        prompt_token_ids = list(output.prompt_token_ids)
+        gt = answers[prompt_idx]
+        for completion in output.outputs:
+            resp_ids = list(completion.token_ids)
+            full_ids = prompt_token_ids + resp_ids
+            response_text = completion.text
             r = score_math(response_text, gt)
-            response_mask = torch.ones_like(response_ids)
-            # Trim trailing pad.
-            if tokenizer.eos_token_id is not None:
-                eos_pos = (response_ids == tokenizer.eos_token_id).nonzero(as_tuple=False)
+            response_mask = torch.ones(len(resp_ids), dtype=torch.long)
+            if eos_id is not None:
+                resp_tensor = torch.tensor(resp_ids, dtype=torch.long)
+                eos_pos = (resp_tensor == eos_id).nonzero(as_tuple=False)
                 if eos_pos.numel() > 0:
                     cut = int(eos_pos[0, 0].item()) + 1
                     response_mask[cut:] = 0
-            all_input_ids.append(full_ids.cpu())
-            all_response_mask.append(response_mask.cpu())
-            all_response_ids.append(response_ids.cpu())
+            all_input_ids.append(torch.tensor(full_ids, dtype=torch.long))
+            all_response_ids.append(torch.tensor(resp_ids, dtype=torch.long))
+            all_response_mask.append(response_mask)
             all_rewards.append(r)
-        if (p_idx + 1) % 4 == 0:
-            print(f"  {p_idx + 1}/{len(prompts)} prompts done", flush=True)
+
+    # Free vLLM before loading HF for the hidden-state forward pass. vLLM 0.8
+    # holds GPU memory across all TP workers; explicit teardown is required.
+    print("Freeing vLLM engine...", flush=True)
+    try:
+        del llm.llm_engine
+    except Exception:
+        pass
+    del llm
+    import gc
+
+    gc.collect()
+    try:
+        from vllm.distributed.parallel_state import (  # type: ignore
+            destroy_distributed_environment,
+            destroy_model_parallel,
+        )
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    except Exception as e:
+        print(f"  vLLM cleanup partial: {e}", flush=True)
+    torch.cuda.empty_cache()
+
+    # ---- Phase 2: HF model on GPU 0 for hidden states. ----
+    print(f"Loading HF model on cuda:0 for hidden-state forward...", flush=True)
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+    ).cuda().eval()
 
     # Pad to common length.
     full_max = max(t.shape[0] for t in all_input_ids)
