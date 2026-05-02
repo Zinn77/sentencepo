@@ -29,6 +29,13 @@ import os
 import sys
 from pathlib import Path
 
+# Must be set before `import vllm` / `LLM(...)`. We touch CUDA in the parent
+# (torch.manual_seed → cuda.manual_seed_all → _lazy_init) before vLLM forks
+# its TP workers; the default fork start method then trips
+# "Cannot re-initialize CUDA in forked subprocess". 'spawn' fixes it.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import torch
 import torch.nn.functional as F
 
@@ -59,6 +66,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top_k", type=int, default=-1)
     p.add_argument("--tensor_parallel_size", type=int, default=8)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.7)
+    # HF forward stage. Aligned with formal RL: actor uses FSDP across all
+    # GPUs in the node and processes ppo_micro_batch_size_per_gpu=4 sequences
+    # per micro-batch. We do plain DDP (one model copy per GPU) which is
+    # mathematically equivalent for inference; --forward_chunk_size mirrors
+    # micro_batch_size, --forward_world_size mirrors n_gpus_per_node.
+    p.add_argument("--forward_chunk_size", type=int, default=4)
+    p.add_argument(
+        "--forward_world_size",
+        type=int,
+        default=0,
+        help="GPUs to use for HF forward (0 = auto = torch.cuda.device_count()).",
+    )
     p.add_argument(
         "--enable_thinking",
         action="store_true",
@@ -263,6 +282,95 @@ def repr_metrics(
     return out
 
 
+def _forward_worker(
+    rank: int,
+    world_size: int,
+    model_path: str,
+    inputs_path: str,
+    response_len: int,
+    hidden_size: int,
+    needed_pos_sorted: list[int],
+    fwd_chunk: int,
+    shard_dir: str,
+) -> None:
+    """One DDP rank: load model on cuda:rank, forward this rank's batch slice,
+    extract needed-layer hidden states + token entropy, dump shard to disk.
+
+    Mirrors formal RL's per-GPU forward (FSDP all-gather → forward → drop).
+    """
+    import torch
+    import torch.nn.functional as F  # noqa: N812
+    from transformers import AutoModelForCausalLM
+
+    torch.cuda.set_device(rank)
+
+    data = torch.load(inputs_path, weights_only=False)
+    full_input: torch.Tensor = data["full_input"]
+    full_attn: torch.Tensor = data["full_attn"]
+    bs = full_input.shape[0]
+
+    per_rank = (bs + world_size - 1) // world_size
+    s = rank * per_rank
+    e = min(s + per_rank, bs)
+    out_path = os.path.join(shard_dir, f"fwd_{rank}.pt")
+    if s >= e:
+        torch.save({"rank": rank, "s": s, "e": e}, out_path)
+        return
+
+    if rank == 0:
+        print(f"[rank {rank}] loading model on cuda:{rank}", flush=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+    ).cuda(rank).eval()
+
+    bs_local = e - s
+    needed_pos = set(needed_pos_sorted)
+    response_hs_local: dict[int, torch.Tensor] = {
+        idx: torch.zeros((bs_local, response_len, hidden_size), dtype=torch.bfloat16)
+        for idx in needed_pos
+    }
+    token_entropy_local = torch.zeros((bs_local, response_len), dtype=torch.float32)
+
+    ent_chunk = max(1, fwd_chunk // 2)
+    for cs in range(0, bs_local, fwd_chunk):
+        ce = min(cs + fwd_chunk, bs_local)
+        gs, ge = s + cs, s + ce
+        with torch.no_grad():
+            out = model(
+                input_ids=full_input[gs:ge].cuda(rank),
+                attention_mask=full_attn[gs:ge].cuda(rank),
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        rl_view = out.logits[:, -response_len - 1 : -1, :]
+        for i in range(0, rl_view.shape[0], ent_chunk):
+            lp = F.log_softmax(rl_view[i : i + ent_chunk].float(), dim=-1)
+            token_entropy_local[cs + i : cs + i + lp.shape[0]] = (
+                -(lp.exp() * lp).sum(dim=-1)
+            ).cpu()
+            del lp
+        del rl_view
+        for idx in needed_pos:
+            response_hs_local[idx][cs:ce] = (
+                out.hidden_states[idx][:, -response_len:, :].cpu()
+            )
+        del out
+        torch.cuda.empty_cache()
+        if rank == 0:
+            print(f"[rank 0] forward chunk {ce}/{bs_local} done", flush=True)
+
+    torch.save(
+        {
+            "rank": rank,
+            "s": s,
+            "e": e,
+            "response_hs": response_hs_local,
+            "token_entropy": token_entropy_local,
+        },
+        out_path,
+    )
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -279,18 +387,40 @@ def main() -> None:
     print(f"Loading {args.num_prompts} prompts from {args.train_parquet}", flush=True)
     prompts_messages, answers = load_prompts(args.train_parquet, args.num_prompts)
 
+    # Tokenize prompts (no truncation), then filter out overlong prompts to
+    # match formal RL config: data.filter_overlong_prompts=True +
+    # data.truncation='error' (see test_sentencepo_v1-5.sh:114-115). Silent
+    # truncation here would cut the trailing "Please reason ... \boxed{}"
+    # instruction and produce 0-reward rollouts.
     chat_template_kwargs: dict = {"enable_thinking": bool(args.enable_thinking)}
     prompt_token_ids_list: list[list[int]] = []
-    for messages in prompts_messages:
+    kept_answers: list[str] = []
+    n_dropped = 0
+    for messages, gt in zip(prompts_messages, answers):
         ids = tokenizer.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
-            max_length=args.max_prompt_tokens,
-            truncation=True,
             **chat_template_kwargs,
         )
-        prompt_token_ids_list.append(list(ids))
+        ids = list(ids)
+        if len(ids) > args.max_prompt_tokens:
+            n_dropped += 1
+            continue
+        prompt_token_ids_list.append(ids)
+        kept_answers.append(gt)
+    if n_dropped > 0:
+        print(
+            f"Filtered {n_dropped}/{len(prompts_messages)} prompts that exceeded "
+            f"max_prompt_tokens={args.max_prompt_tokens} after chat templating.",
+            flush=True,
+        )
+    answers = kept_answers
+    if not prompt_token_ids_list:
+        raise RuntimeError(
+            f"All {len(prompts_messages)} prompts exceed max_prompt_tokens="
+            f"{args.max_prompt_tokens}. Increase --max_prompt_tokens or expand --num_prompts."
+        )
 
     # ---- Phase 1: vLLM rollout (aligned with formal RL: vllm + TP, n=8, T=1.0). ----
     from vllm import LLM, SamplingParams
@@ -376,13 +506,14 @@ def main() -> None:
         print(f"  vLLM cleanup partial: {e}", flush=True)
     torch.cuda.empty_cache()
 
-    # ---- Phase 2: HF model on GPU 0 for hidden states. ----
-    print(f"Loading HF model on cuda:0 for hidden-state forward...", flush=True)
-    from transformers import AutoModelForCausalLM
+    # ---- Phase 2: HF forward across all visible GPUs (DDP, equivalent to
+    # formal RL's FSDP forward for inference; one full model copy per GPU,
+    # each rank handles bs / world_size sequences). ----
+    from transformers import AutoConfig
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
-    ).cuda().eval()
+    cfg = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    total_layers = cfg.num_hidden_layers + 1  # +1 for input embedding
+    hidden_size = cfg.hidden_size
 
     # Pad to common length.
     full_max = max(t.shape[0] for t in all_input_ids)
@@ -406,12 +537,9 @@ def main() -> None:
     print("Building sentence ids...", flush=True)
     sentence_ids = build_sentence_ids(response_ids, response_mask, tokenizer, args.min_sent_tokens)
 
-    # Single forward with all-layer hidden states; we also reuse out.logits
-    # for token entropy so there's no second forward pass.
-    print("Running forward (with all hidden states)...", flush=True)
+    bs = full_input.shape[0]
     response_len = response_ids.shape[1]
 
-    # Only extract the layers we'll actually pool — keeps CPU memory bounded.
     needed_layers: set[int] = set()
     for layer in layers:
         if isinstance(layer, int):
@@ -419,38 +547,64 @@ def main() -> None:
         else:
             for x in layer:
                 needed_layers.add(int(x))
-
-    with torch.no_grad():
-        out = model(
-            input_ids=full_input.cuda(),
-            attention_mask=full_attn.cuda(),
-            output_hidden_states=True,
-            use_cache=False,
-        )
-
-    # Token entropy from logits, chunked over batch. Materializing the full
-    # fp32 softmax (bs × T × |V|) was the OOM source; chunk_size=8 caps the
-    # transient at ~5 GB.
-    print("Computing token entropy from logits (chunked)...", flush=True)
-    chunk_size = 8
-    rl_view = out.logits[:, -response_len - 1 : -1, :]
-    ent_parts: list[torch.Tensor] = []
-    for i in range(0, rl_view.shape[0], chunk_size):
-        lp = F.log_softmax(rl_view[i : i + chunk_size].float(), dim=-1)
-        ent_parts.append((-(lp.exp() * lp).sum(dim=-1)).cpu())
-        del lp
-    token_entropy = torch.cat(ent_parts, dim=0)
-    del rl_view
-
-    # Extract only needed layers; keep bf16 on CPU (fp32 cast at use site).
-    total_layers = len(out.hidden_states)
     needed_pos = {(i if i >= 0 else total_layers + i) for i in needed_layers}
+
+    # Persist inputs so each spawned worker can mmap them in.
+    import shutil
+    import tempfile
+
+    shard_dir = tempfile.mkdtemp(prefix="phase_a_")
+    inputs_path = os.path.join(shard_dir, "inputs.pt")
+    torch.save({"full_input": full_input, "full_attn": full_attn}, inputs_path)
+
+    # Give vLLM workers a moment to fully exit before spawning forward DDP.
+    import time
+
+    time.sleep(3)
+
+    world_size = args.forward_world_size or torch.cuda.device_count()
+    fwd_chunk = args.forward_chunk_size
+    print(
+        f"Spawning {world_size}-way DDP forward "
+        f"(per-rank bs={(bs + world_size - 1) // world_size}, "
+        f"fwd_chunk={fwd_chunk}, layers_kept={sorted(needed_pos)}/{total_layers})...",
+        flush=True,
+    )
+
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _forward_worker,
+        args=(
+            world_size,
+            args.model_path,
+            inputs_path,
+            response_len,
+            hidden_size,
+            sorted(needed_pos),
+            fwd_chunk,
+            shard_dir,
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+
+    print("Aggregating forward shards...", flush=True)
     response_hs_per_layer: list[torch.Tensor | None] = [None] * total_layers
     for idx in needed_pos:
-        response_hs_per_layer[idx] = out.hidden_states[idx][:, -response_len:, :].cpu()
-
-    del out
-    torch.cuda.empty_cache()
+        response_hs_per_layer[idx] = torch.zeros(
+            (bs, response_len, hidden_size), dtype=torch.bfloat16
+        )
+    token_entropy = torch.zeros((bs, response_len), dtype=torch.float32)
+    for rank in range(world_size):
+        shard_path = os.path.join(shard_dir, f"fwd_{rank}.pt")
+        shard = torch.load(shard_path, weights_only=False)
+        s, e = shard["s"], shard["e"]
+        if s < e:
+            for idx in needed_pos:
+                response_hs_per_layer[idx][s:e] = shard["response_hs"][idx]
+            token_entropy[s:e] = shard["token_entropy"]
+    shutil.rmtree(shard_dir, ignore_errors=True)
 
     punct_ids = build_punct_token_ids(tokenizer)
 

@@ -100,10 +100,10 @@ if [ "${SKIP_PHASE_A:-0}" != "1" ]; then
     echo "  输出：$PHASE_A_OUT"
     echo "============================================================"
     mkdir -p "$(dirname "$PHASE_A_OUT")"
-    # Phase A 与正式 RL rollout 严格对齐（详见 phaseB.sh:163-171 + rollout.yaml）：
-    #   引擎 vLLM, TP=8 单进程, n=8, T=1.0, top_p=1.0, top_k=-1,
-    #   max_prompt_length=1024, max_response_length=4096, enable_thinking=False.
-    # 8 卡同时吃满，约 15–25 min。
+    # Phase A 与正式 RL 严格对齐：
+    #   rollout：vLLM TP=8, n=8, T=1.0, top_p=1.0, top_k=-1, max_prompt=1024, max_response=4096
+    #   forward：8 卡 DDP（语义等价 FSDP forward），forward_chunk_size=4 对齐 micro_batch_size=4
+    # 32 prompts × 8 rollouts = 256 序列，每卡 forward 32 条；总耗时 8–12 min。
     python3 scripts_server/diagnose_sentence_repr.py \
         --model_path "$MODEL_PATH" \
         --train_parquet "$DATA_DIR/math/train.parquet" \
@@ -117,6 +117,8 @@ if [ "${SKIP_PHASE_A:-0}" != "1" ]; then
         --top_k -1 \
         --max_prompt_tokens 1024 \
         --max_new_tokens 4096 \
+        --forward_chunk_size 4 \
+        --forward_world_size 8 \
         --seed "$SEED"
     echo "Phase A 完成。请查看 $PHASE_A_OUT，若与默认 top1/top2 不一致，覆盖 SCR_*/SLPA_* 环境变量后再跑 Phase B。"
 fi
