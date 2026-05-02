@@ -186,6 +186,13 @@ def build_sentence_ids(
         for sid, sent in enumerate(sentences):
             for pos in sent:
                 sentence_ids[b, pos] = sid
+    # Match verl/utils/dataset/rl_dataset.py:65-69 collate_fn: add b*10000
+    # offset so sentence_ids are globally unique across the batch. Without
+    # this, torch.unique() in pool_sentence_embeddings collapses all "sentence
+    # 0" across rollouts into a single bucket, killing the diagnostic.
+    for b in range(bs):
+        mask = sentence_ids[b] >= 0
+        sentence_ids[b][mask] += b * 10000
     return sentence_ids
 
 
