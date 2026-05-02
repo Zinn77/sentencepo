@@ -439,6 +439,10 @@ def main() -> None:
         trust_remote_code=True,
         enforce_eager=False,
         seed=args.seed,
+        # Custom all-reduce uses direct P2P which often isn't exposed inside
+        # docker containers (autodl / similar). Falls back to NCCL all-reduce
+        # which is ~10-20% slower for TP comms but 100% compatible.
+        disable_custom_all_reduce=True,
     )
     sampling = SamplingParams(
         n=args.rollouts_per_prompt,
