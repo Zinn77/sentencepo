@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Day 0 / Machine 4 — Hidden Phase B: combined SCR+SLPA at layer=-18 (Phase A top-1)
+# Day 0 / Machine 2 — Hidden Phase B: combined SCR+SLPA at layer=-18 (Phase A top-1)
 #
 # 同 Day 0 M1 的 hpo_09_C1，仅把 SLPA / SCR 的 hidden_layer_index 从 -1 切到 -18。
 # Pooling 都用 last（Phase A top-1：-18/last gap=0.1285，比 -1/last gap=0.0568 高 2.3×）。
@@ -11,7 +11,7 @@
 set -e
 cd "$HOME/sentencepo_v1-5"
 
-EXP_TAG="2026-05-03_day0_M4_hidden_combined_L-18_ep3" \
+EXP_TAG="2026-05-03_day0_M2_hidden_combined_L-18_ep3" \
   LOSS_MODE=sentencepo \
   PER_SENT_ADV=true \
   SENTPO_EPS=0.03 \
