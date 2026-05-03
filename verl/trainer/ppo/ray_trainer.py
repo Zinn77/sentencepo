@@ -369,9 +369,11 @@ def compute_advantage(
         data.batch["returns"] = returns
 
     # ---- Sentence-level advantage modules (bucket/compare, SLPA, SCR) ----
-    # Shared tensors used by all embedding-based modules
-    _sentence_ids = data.batch.get("sentence_ids")
-    _response_mask = data.batch.get("response_mask")
+    # Shared tensors used by all embedding-based modules.
+    # tensordict>=0.6 raises KeyError on missing key without explicit default,
+    # which would crash plain GRPO+vanilla runs (no sentence_ids in batch).
+    _sentence_ids = data.batch.get("sentence_ids", default=None)
+    _response_mask = data.batch.get("response_mask", default=None)
     _index = data.non_tensor_batch.get("uid") if data.non_tensor_batch is not None else None
     _has_sent_data = _sentence_ids is not None and _response_mask is not None and _index is not None
 
