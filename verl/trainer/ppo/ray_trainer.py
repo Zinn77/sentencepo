@@ -1913,6 +1913,24 @@ class RayPPOTrainer:
                             batch.meta_info["return_hidden_states"] = True
                             batch.meta_info["sentence_adv_pool_only"] = True
                             batch.meta_info["return_last_hidden_state_only"] = True
+                            # The actor worker is constructed with config=actor_rollout_ref
+                            # (no `algorithm` field), so it cannot read repr.hidden_layer_index
+                            # itself. Pass it through meta_info from here.
+                            for _cfg in (sentence_adv_cfg, slpa_cfg, scr_cfg):
+                                if _cfg is not None and bool(getattr(_cfg, "enable", False)):
+                                    _repr_cfg = getattr(_cfg, "repr", None)
+                                    if _repr_cfg is not None:
+                                        _layer = getattr(_repr_cfg, "hidden_layer_index", -1)
+                                        # ListConfig isn't always pickle-clean across Ray;
+                                        # convert to plain int or list[int] before stashing.
+                                        if isinstance(_layer, int):
+                                            batch.meta_info["hidden_layer_index"] = _layer
+                                        else:
+                                            try:
+                                                batch.meta_info["hidden_layer_index"] = [int(i) for i in _layer]
+                                            except TypeError:
+                                                batch.meta_info["hidden_layer_index"] = -1
+                                        break
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
