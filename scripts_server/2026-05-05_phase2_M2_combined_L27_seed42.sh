@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Phase 2 / M2 — combined v1-5 × L=-27 × seed=42 × ep2 (12h)
+# 层曲线消融点：deeper-back，验证 L=-27 是否单峰回落（Phase A: gap 0.071）。
+set -e
+cd "$HOME/sentencepo_v1-5"
+
+EXP_TAG="2026-05-05_phase2_combined_L-27" \
+  LOSS_MODE=sentencepo \
+  PER_SENT_ADV=true \
+  SENTPO_EPS=0.03 \
+  SLPA_ENABLE=true \
+  SLPA_ALPHA_C=0.05 \
+  SLPA_ALPHA_I=0.05 \
+  SLPA_LAYER=-27 \
+  SLPA_POOL=last \
+  SCR_ENABLE=true \
+  SCR_ALPHA_C=0.02 \
+  SCR_ALPHA_I=0.02 \
+  SCR_LAYER=-27 \
+  SCR_POOL=last \
+  ALPHA_DECAY=none \
+  MAX_RESP_LEN=4096 \
+  EPOCHS=2 \
+  SEED=42 \
+  bash scripts_server/2026-05-03_v1-5-hidden_run.sh
