@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Phase 1 / M1 — v1-5 winner_config × Qwen3 × seed=9 × ep3
+# Phase 1 / M1 — v1-5 winner_config × Qwen3 × seed=9 × ep1
 #
-# winner_config 由 _phase1_winner_config.sh 提供（Phase 0 完成后由 user 编辑）。
-# 默认 = M2 default (slpa 0.05/0.05 + scr 0.02/0.02 + L=-18 + last)。
-# multi-seed 主表的第二个 seed（已有 seed=42 = M2 default running）。
+# winner_config = smaller_alpha（slpa 0.02 + scr 0.01）。
+# Phase 1 主表 ep1 multi-seed 第二个 seed
+# (seed=42 from Phase 0 smaller_alpha, peak 0.3795).
 set -e
 cd "$HOME/sentencepo_v1-5"
 
@@ -11,6 +11,6 @@ source scripts_server/2026-05-05_phase1_winner_config.sh
 
 EXP_TAG="2026-05-05_phase1_winner_qwen3" \
   MAX_RESP_LEN=4096 \
-  EPOCHS=3 \
+  EPOCHS=1 \
   SEED=9 \
   bash scripts_server/2026-05-03_v1-5-hidden_run.sh
