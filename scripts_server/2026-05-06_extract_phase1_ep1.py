@@ -84,13 +84,15 @@ def main():
             # Print partial
             print(f"{tag:<28} {len(per):>6} (partial: only {sum(1 for d in per.values() if all(ds in d for ds in DATASETS))} full blocks)")
             continue
-        # Limit to ep1 (step <= 58) for ep3 logs
-        ep1_steps = [s for s in sorted(full) if s <= 58]
+        # ep1 peak: use step <= 55 for fair alignment (ep3 logs have no step 58)
+        # ep1 end:  use step == 55 strictly (or largest <= 55 fallback)
+        ep1_steps = [s for s in sorted(full) if s <= 55]
         if not ep1_steps:
             continue
         means = [(s, sum(full[s][d] for d in DATASETS)/6.0) for s in ep1_steps]
         peak_step, peak_mean = max(means, key=lambda x: x[1])
-        ep1_end_mean = full[max(ep1_steps)][None] if False else (sum(full[max(ep1_steps)][d] for d in DATASETS)/6.0)
+        end_step = 55 if 55 in full else max(ep1_steps)
+        ep1_end_mean = sum(full[end_step][d] for d in DATASETS) / 6.0
         per_ds = full[peak_step]
         ds_str = " ".join(f"{per_ds[d]:.3f}" for d in DATASETS)
         print(f"{tag:<28} {len(ep1_steps):>6} {peak_mean:>10.4f} {peak_step:>6} {ep1_end_mean:>8.4f}  {ds_str}")
