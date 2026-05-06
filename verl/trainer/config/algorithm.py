@@ -21,6 +21,7 @@ __all__ = [
     "AlgoConfig",
     "FilterGroupsConfig",
     "KLControlConfig",
+    "KTAEConfig",
     "SentenceAdvConfig",
     "SentenceReprConfig",
     "SLPAConfig",
@@ -179,6 +180,43 @@ class SCRConfig(BaseConfig):
 
 
 @dataclass
+class KTAEConfig(BaseConfig):
+    """Configuration for KTAE (Key-Token Advantage Estimation) baseline.
+
+    Reference: Sun et al., "KTAE: A Model-Free Algorithm to Key-Tokens
+    Advantage Estimation in Mathematical Reasoning" (arXiv:2505.16826).
+
+    Defaults match KTAE upstream's *actual training* behaviour, which uses
+    the values hardcoded in ``compute_ktae_outcome_advantage_and_keytokens``
+    rather than the values declared in ``run_qwen2.5_math_1.5b.sh``: KTAE's
+    upstream function does not consult ``config``, so the shell-script
+    ``algorithm.beta_ig=2.0`` is dead config and the runtime value is 1.0.
+    Our re-implementation exposes the config so reviewers can vary it, but
+    the default matches what KTAE actually trains with.
+
+    Args:
+        alpha: Weight on the Fisher exact test channel.
+        beta_ig: Weight on the information-gain channel.
+        gamma_tf: Weight on the BM25-style TF correction channel
+            (0 disables the TF term).
+        top: Upper bound on the per-token weight after the (sigmoid-0.5)*2*top
+            squashing.
+        bottom: Lower bound (kept for API parity with KTAE upstream; not
+            used by the current squashing).
+        pad_token_id: Token id whose KTAE weight is forced to 0. KTAE
+            upstream hardcodes 151643 (Qwen pad). Override for other
+            tokenisers (Llama-3 EOS = 128009).
+    """
+
+    alpha: float = 1.0
+    beta_ig: float = 1.0
+    gamma_tf: float = 1.0
+    top: float = 1.0
+    bottom: float = -1.0
+    pad_token_id: int = 151643
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -228,3 +266,4 @@ class AlgoConfig(BaseConfig):
     sentence_adv: Optional[SentenceAdvConfig] = None
     slpa: Optional[SLPAConfig] = None
     scr: Optional[SCRConfig] = None
+    ktae: Optional[KTAEConfig] = None

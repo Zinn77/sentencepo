@@ -163,6 +163,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    KTAE = "ktae"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -1455,6 +1456,112 @@ def compute_rloo_vectorized_outcome_advantage(
         adv = adv.unsqueeze(-1) * response_mask
 
     return adv, adv
+
+
+@register_adv_est(AdvantageEstimator.KTAE)  # or simply: @register_adv_est("ktae")
+def compute_ktae_outcome_advantage_and_keytokens(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    responses: torch.Tensor,
+    epsilon: float = 1e-6,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """KTAE: Key-Token Advantage Estimation.
+
+    Adapted from https://github.com/ZNLP/KTAE (verl-native; preserves original
+    algorithm verbatim). Computes a per-token-vocab-id weight from group-internal
+    correctness statistics (Fisher exact test, Information Gain, Cohen's h with
+    optional BM25 TF), then adds it to the GRPO-normalised sequence advantage so
+    that tokens identified as discriminative for correctness receive a non-uniform
+    credit boost.
+
+    Args:
+        token_level_rewards: shape (bs, response_length).
+        response_mask: shape (bs, response_length); the response portion of the
+            attention mask.
+        index: per-rollout group identifier.
+        responses: shape (bs, response_length); token ids of the rollouts.
+        config: AlgoConfig (reads ``config.ktae`` for hyperparameters).
+
+    Returns:
+        advantages, returns; both shape (bs, response_length). Returned twice for
+        API parity with other registered estimators.
+    """
+    from verl.workers.actor.compute_key_tokens import ComputeKeyTokens
+
+    response_length = token_level_rewards.shape[-1]
+    eos_mask = response_mask
+
+    # Resolve KTAE hyperparameters from config. Defaults match KTAE upstream's
+    # actual training values (hardcoded in upstream's function body); upstream
+    # does not consult config, so shell-script overrides like beta_ig=2.0 are
+    # dead config in the official repo. We expose them so they can be ablated.
+    ktae_cfg = getattr(config, "ktae", None) if config is not None else None
+    alpha = float(getattr(ktae_cfg, "alpha", 1.0)) if ktae_cfg is not None else 1.0
+    beta_ig = float(getattr(ktae_cfg, "beta_ig", 1.0)) if ktae_cfg is not None else 1.0
+    gamma_tf = float(getattr(ktae_cfg, "gamma_tf", 1.0)) if ktae_cfg is not None else 1.0
+    top = float(getattr(ktae_cfg, "top", 1.0)) if ktae_cfg is not None else 1.0
+    bottom = float(getattr(ktae_cfg, "bottom", -1.0)) if ktae_cfg is not None else -1.0
+    pad_token_id = int(getattr(ktae_cfg, "pad_token_id", 151643)) if ktae_cfg is not None else 151643
+
+    id2score = defaultdict(list)
+    id2reponses = {}
+    id2mask = {}
+    id2mean = {}
+    id2std = {}
+    scores = token_level_rewards.sum(dim=-1)
+    with torch.no_grad():
+        bsz = token_level_rewards.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+            if index[i] in id2reponses:
+                id2reponses[index[i]] = torch.cat((id2reponses[index[i]], responses[i].unsqueeze(0)), dim=0)
+            else:
+                id2reponses[index[i]] = responses[i].unsqueeze(0)
+            if index[i] in id2mask:
+                id2mask[index[i]] = torch.cat((id2mask[index[i]], eos_mask[i].unsqueeze(0)), dim=0)
+            else:
+                id2mask[index[i]] = eos_mask[i].unsqueeze(0)
+        id2key_token = {}
+        max_token_num = int(responses.max().item())
+        for idx in id2score:
+            reponses_per_q = id2reponses[idx]
+            mask_per_q = id2mask[idx]
+            score_per_q = id2score[idx]
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+                id2key_token[idx] = torch.zeros([max_token_num + 1], device=responses.device)
+            elif len(id2score[idx]) > 1:
+                format_score_per_q = torch.tensor(score_per_q)
+                id2mean[idx] = torch.mean(format_score_per_q)
+                id2std[idx] = torch.std(format_score_per_q)
+                computer = ComputeKeyTokens(
+                    alpha=alpha,
+                    beta_ig=beta_ig,
+                    gamma_tf=gamma_tf,
+                    top=top,
+                    bottom=bottom,
+                    responses_ids=reponses_per_q,
+                    mask=mask_per_q,
+                    rewards=format_score_per_q,
+                    max_token_num=max_token_num,
+                    pad_token_id=pad_token_id,
+                )
+
+                key_tokens = computer.get_key_tokens().to(reponses_per_q.device)
+                id2key_token[idx] = key_tokens
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        means = torch.tensor([id2mean[index[i]] for i in range(bsz)], device=scores.device)
+        stds = torch.tensor([id2std[index[i]] for i in range(bsz)], device=scores.device)
+        scores = (scores - means) / (stds + epsilon)
+        format_weights = [id2key_token[index[i]][responses[i]].unsqueeze(0) for i in range(bsz)]
+        all_weight = torch.cat(format_weights, dim=0)
+        scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask + all_weight * eos_mask
+    return scores, scores
 
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
