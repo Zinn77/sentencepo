@@ -30,7 +30,13 @@
 #   EPOCHS           : trainer.total_epochs               [3]
 #   SEED             : random seed                        [42]
 #   ALPHA_DECAY      : none | linear                      [none]
+#   ALPHA_MIN_RATIO  : SLPA/SCR alpha min ratio (0~1)     [0.1]
 #   KL_LOSS_COEF     : actor.kl_loss_coef                 [0.001]
+#   ENTROPY_COEFF    : actor.entropy_coeff                [0]
+#   LAMBDA_PPL       : sentencepo adaptive clip × PPL     [0]
+#   LAMBDA_LEN       : sentencepo adaptive clip × length  [0]
+#   SENTPO_CMIN      : sentencepo clip-scale lower bound  [0.5]
+#   SENTPO_CMAX      : sentencepo clip-scale upper bound  [1.5]
 #   ROLLOUT_TEMP     : rollout sampling temperature       [1.0]
 #
 # === Path overrides (machine-specific) ===
@@ -65,7 +71,13 @@ MAX_RESP_LEN=${MAX_RESP_LEN:-4096}
 EPOCHS=${EPOCHS:-3}
 SEED=${SEED:-42}
 ALPHA_DECAY=${ALPHA_DECAY:-none}
+ALPHA_MIN_RATIO=${ALPHA_MIN_RATIO:-0.1}
 KL_LOSS_COEF=${KL_LOSS_COEF:-0.001}
+ENTROPY_COEFF=${ENTROPY_COEFF:-0}
+LAMBDA_PPL=${LAMBDA_PPL:-0}
+LAMBDA_LEN=${LAMBDA_LEN:-0}
+SENTPO_CMIN=${SENTPO_CMIN:-0.5}
+SENTPO_CMAX=${SENTPO_CMAX:-1.5}
 ROLLOUT_TEMP=${ROLLOUT_TEMP:-1.0}
 DS=${DS:-math}
 
@@ -155,7 +167,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$micro_batch_size \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.entropy_coeff=$ENTROPY_COEFF \
     actor_rollout_ref.actor.kl_loss_coef=$KL_LOSS_COEF \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
@@ -177,10 +189,10 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.policy_loss.loss_mode=$LOSS_MODE \
     +actor_rollout_ref.actor.policy_loss.sentencepo_min_sent_tokens=$sentencepo_min_sent_tokens \
     +actor_rollout_ref.actor.policy_loss.sentencepo_eps_base=$SENTPO_EPS \
-    +actor_rollout_ref.actor.policy_loss.sentencepo_lambda_ppl=$sentencepo_lambda_ppl \
-    +actor_rollout_ref.actor.policy_loss.sentencepo_lambda_len=$sentencepo_lambda_len \
-    +actor_rollout_ref.actor.policy_loss.sentencepo_cmin=$sentencepo_cmin \
-    +actor_rollout_ref.actor.policy_loss.sentencepo_cmax=$sentencepo_cmax \
+    +actor_rollout_ref.actor.policy_loss.sentencepo_lambda_ppl=$LAMBDA_PPL \
+    +actor_rollout_ref.actor.policy_loss.sentencepo_lambda_len=$LAMBDA_LEN \
+    +actor_rollout_ref.actor.policy_loss.sentencepo_cmin=$SENTPO_CMIN \
+    +actor_rollout_ref.actor.policy_loss.sentencepo_cmax=$SENTPO_CMAX \
     +actor_rollout_ref.actor.policy_loss.sentencepo_stats_eps=$sentencepo_stats_eps \
     +actor_rollout_ref.actor.policy_loss.sentencepo_metrics_level=$sentencepo_metrics_level \
     +actor_rollout_ref.actor.policy_loss.sentencepo_per_sentence_adv=$PER_SENT_ADV \
@@ -194,7 +206,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +algorithm.slpa.correctness_threshold=0.0 \
     +algorithm.slpa.metrics_enable=true \
     +algorithm.slpa.alpha_decay=$ALPHA_DECAY \
-    +algorithm.slpa.alpha_min_ratio=0.1 \
+    +algorithm.slpa.alpha_min_ratio=$ALPHA_MIN_RATIO \
     +algorithm.slpa.repr.hidden_layer_index=$SLPA_LAYER_ARG \
     +algorithm.slpa.repr.pooling=$SLPA_POOL \
     +algorithm.scr.enable=$SCR_ENABLE \
@@ -207,7 +219,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +algorithm.scr.correctness_threshold=0.0 \
     +algorithm.scr.metrics_enable=true \
     +algorithm.scr.alpha_decay=$ALPHA_DECAY \
-    +algorithm.scr.alpha_min_ratio=0.1 \
+    +algorithm.scr.alpha_min_ratio=$ALPHA_MIN_RATIO \
     +algorithm.scr.repr.hidden_layer_index=$SCR_LAYER_ARG \
     +algorithm.scr.repr.pooling=$SCR_POOL \
     actor_rollout_ref.actor.checkpoint.save_contents='["model"]' \
