@@ -127,6 +127,9 @@ class SLPAConfig(BaseConfig):
         metrics_enable (bool): Whether to emit SLPA diagnostics.
         alpha_decay (str): Decay schedule for alpha ('none' or 'linear').
         alpha_min_ratio (float): Minimum alpha as fraction of initial (for linear decay).
+        top_k (int): If >0, restrict V_k regression to the top-K most kernel-similar
+            cross-rollout sentences (per zzx_slpa.md §3.1.3). 0 disables filtering
+            (use all leave-one-out sentences). Default 0 preserves prior behavior.
     """
 
     enable: bool = False
@@ -140,6 +143,7 @@ class SLPAConfig(BaseConfig):
     metrics_enable: bool = True
     alpha_decay: str = "none"
     alpha_min_ratio: float = 0.1
+    top_k: int = 0
     repr: SentenceReprConfig = field(default_factory=SentenceReprConfig)
 
 

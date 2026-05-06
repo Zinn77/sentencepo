@@ -644,6 +644,7 @@ def compute_slpa_advantage(
     do_normalize = bool(getattr(slpa_cfg, "normalize", True))
     eps = float(getattr(slpa_cfg, "eps", 1e-8))
     metrics_enable = bool(getattr(slpa_cfg, "metrics_enable", True))
+    top_k = int(getattr(slpa_cfg, "top_k", 0) or 0)
 
     sent_emb = F.normalize(sentence_embeddings.float().to(device), dim=-1)
     unique_sid = sentence_unique_ids.to(device)
@@ -711,6 +712,15 @@ def compute_slpa_advantage(
             # Leave-one-out: mask sentences from the same rollout
             same_rollout = g_sample_ids.unsqueeze(1) == g_sample_ids.unsqueeze(0)
             K = K_emb * K_pos * (~same_rollout).float()
+
+            # Top-K filtering: per zzx_slpa.md §3.1.3, restrict regression to the
+            # top_k most kernel-similar cross-rollout sentences. Disabled when
+            # top_k=0 (default) or when top_k >= n_g (all candidates already kept).
+            if top_k > 0 and top_k < n_g:
+                _, topk_idx = torch.topk(K, k=top_k, dim=1)
+                topk_mask = torch.zeros_like(K, dtype=torch.bool)
+                topk_mask.scatter_(1, topk_idx, True)
+                K = K * topk_mask.float()
 
             # V_k(i) = Σ_j K[k,j]·r_j / Σ_j K[k,j]
             weighted_r = K * g_rewards.unsqueeze(0)
